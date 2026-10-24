@@ -1,10 +1,15 @@
 import ExpoModulesCore
+import Foundation
 import MultipeerConnectivity
 import NearbyInteraction
+import UIKit
 
-public class ParallaxModule: Module {
+public final class ParallaxModule: Module {
   private let serviceType = "parallax-uwb"
+  private lazy var multipeerDelegate = ParallaxMultipeerDelegate(owner: self)
+  private lazy var nearbyInteractionDelegate = ParallaxNearbyInteractionDelegate(owner: self)
   private var browser: MCNearbyServiceBrowser?
+  private var advertiser: MCNearbyServiceAdvertiser?
   private var session: MCSession?
   private var niSession: NISession?
   private var peers: [String: MCPeerID] = [:]
@@ -13,22 +18,280 @@ public class ParallaxModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ParallaxModule")
     Events("peerDiscovered", "connectionChanged", "distanceUpdated", "error")
+
     AsyncFunction("startDiscovery") { [weak self] in self?.startDiscovery() }
     AsyncFunction("stopDiscovery") { [weak self] in self?.stopDiscovery() }
     AsyncFunction("connect") { [weak self] (peerId: String) in try self?.connect(peerId: peerId) }
     AsyncFunction("disconnect") { [weak self] in self?.disconnect() }
     AsyncFunction("startRanging") { [weak self] in try self?.startRanging() }
-    AsyncFunction("stopRanging") { [weak self] in self?.niSession?.invalidate(); self?.niSession = nil }
+    AsyncFunction("stopRanging") { [weak self] in
+      self?.niSession?.invalidate()
+      self?.niSession = nil
+    }
   }
 
-  private func startDiscovery() { let local = MCPeerID(displayName: UIDevice.current.name); let mc = MCSession(peer: local, securityIdentity: nil, encryptionPreference: .required); mc.delegate = self; session = mc; let next = MCNearbyServiceBrowser(peer: local, serviceType: serviceType); next.delegate = self; browser = next; next.startBrowsingForPeers(); sendEvent("connectionChanged", ["state": "disconnected"]) }
-  private func stopDiscovery() { browser?.stopBrowsingForPeers(); browser = nil; session?.disconnect(); session = nil; peers.removeAll() }
-  private func connect(peerId: String) throws { guard let peer = peers[peerId], let browser else { throw NSError(domain: "Parallax", code: 1, userInfo: [NSLocalizedDescriptionKey: "Peer is no longer available"]) }; selectedPeer = peer; sendEvent("connectionChanged", ["state": "connecting"]); browser.invitePeer(peer, to: session!, withContext: nil, timeout: 15) }
-  private func disconnect() { niSession?.invalidate(); niSession = nil; session?.disconnect(); selectedPeer = nil; sendEvent("connectionChanged", ["state": "disconnected"]) }
-  private func startRanging() throws { guard let peer = selectedPeer, let session else { throw NSError(domain: "Parallax", code: 2, userInfo: [NSLocalizedDescriptionKey: "Connect to a peer before ranging"]) }; guard NISession.isSupported else { throw NSError(domain: "Parallax", code: 3, userInfo: [NSLocalizedDescriptionKey: "Nearby Interaction is not supported on this device"]) }; let ni = NISession(); ni.delegate = self; niSession = ni; let token = ni.discoveryToken!.rawValue; try session.send(token, toPeers: [peer], with: .reliable) }
-  private func fail(_ error: Error, code: String = "native_error") { sendEvent("error", ["code": code, "message": error.localizedDescription, "recoverable": true]) }
+  private func startDiscovery() {
+    let localPeer = MCPeerID(displayName: UIDevice.current.name)
+    let mcSession = MCSession(peer: localPeer, securityIdentity: nil, encryptionPreference: .required)
+    mcSession.delegate = multipeerDelegate
+    session = mcSession
+
+    let nextBrowser = MCNearbyServiceBrowser(peer: localPeer, serviceType: serviceType)
+    nextBrowser.delegate = multipeerDelegate
+    browser = nextBrowser
+
+    let nextAdvertiser = MCNearbyServiceAdvertiser(
+      peer: localPeer,
+      discoveryInfo: nil,
+      serviceType: serviceType
+    )
+    nextAdvertiser.delegate = multipeerDelegate
+    advertiser = nextAdvertiser
+
+    nextBrowser.startBrowsingForPeers()
+    nextAdvertiser.startAdvertisingPeer()
+    sendEvent("connectionChanged", ["state": "disconnected"])
+  }
+
+  private func stopDiscovery() {
+    browser?.stopBrowsingForPeers()
+    advertiser?.stopAdvertisingPeer()
+    browser = nil
+    advertiser = nil
+    session?.disconnect()
+    session = nil
+    peers.removeAll()
+  }
+
+  private func connect(peerId: String) throws {
+    guard let peer = peers[peerId], let browser, let session else {
+      throw NSError(domain: "Parallax", code: 1, userInfo: [
+        NSLocalizedDescriptionKey: "Peer is no longer available"
+      ])
+    }
+
+    selectedPeer = peer
+    sendEvent("connectionChanged", ["state": "connecting"])
+    browser.invitePeer(peer, to: session, withContext: nil, timeout: 15)
+  }
+
+  private func disconnect() {
+    niSession?.invalidate()
+    niSession = nil
+    session?.disconnect()
+    selectedPeer = nil
+    sendEvent("connectionChanged", ["state": "disconnected"])
+  }
+
+  private func makeNISessionIfNeeded() throws -> NISession {
+    guard NISession.isSupported else {
+      throw NSError(domain: "Parallax", code: 3, userInfo: [
+        NSLocalizedDescriptionKey: "Nearby Interaction is not supported on this device"
+      ])
+    }
+
+    if let niSession { return niSession }
+
+    let nextSession = NISession()
+    nextSession.delegate = nearbyInteractionDelegate
+    niSession = nextSession
+    return nextSession
+  }
+
+  private func startRanging() throws {
+    guard let peer = selectedPeer, let session else {
+      throw NSError(domain: "Parallax", code: 2, userInfo: [
+        NSLocalizedDescriptionKey: "Connect to a peer before ranging"
+      ])
+    }
+
+    let nearbySession = try makeNISessionIfNeeded()
+    guard let token = nearbySession.discoveryToken else {
+      throw NSError(domain: "Parallax", code: 4, userInfo: [
+        NSLocalizedDescriptionKey: "Nearby Interaction did not provide a discovery token"
+      ])
+    }
+
+    let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+    try session.send(data, toPeers: [peer], with: .reliable)
+  }
+
+  fileprivate func receiveDiscoveryToken(_ data: Data) {
+    do {
+      guard let token = try NSKeyedUnarchiver.unarchivedObject(
+        ofClass: NIDiscoveryToken.self,
+        from: data
+      ) else {
+        throw NSError(domain: "Parallax", code: 5, userInfo: [
+          NSLocalizedDescriptionKey: "Received an empty Nearby Interaction token"
+        ])
+      }
+
+      let nearbySession = try makeNISessionIfNeeded()
+      nearbySession.run(NINearbyPeerConfiguration(peerToken: token))
+    } catch {
+      fail(error, code: "token_exchange_failed")
+    }
+  }
+
+  fileprivate func fail(_ error: Error, code: String = "native_error") {
+    sendEvent("error", [
+      "code": code,
+      "message": error.localizedDescription,
+      "recoverable": true
+    ])
+  }
+
+  fileprivate func foundPeer(_ peerID: MCPeerID) {
+    peers[peerID.displayName] = peerID
+    sendEvent("peerDiscovered", ["id": peerID.displayName, "name": peerID.displayName])
+  }
+
+  fileprivate func lostPeer(_ peerID: MCPeerID) {
+    peers.removeValue(forKey: peerID.displayName)
+  }
+
+  fileprivate func acceptInvitation(from peerID: MCPeerID, _ handler: @escaping (Bool, MCSession?) -> Void) {
+    selectedPeer = peerID
+    handler(true, session)
+  }
+
+  fileprivate func connectionChanged(_ state: MCSessionState, peer: MCPeerID) {
+    if state == .connected {
+      selectedPeer = peer
+    }
+    let value = state == .connected ? "connected" : state == .connecting ? "connecting" : "disconnected"
+    sendEvent("connectionChanged", ["state": value])
+  }
+
+  fileprivate func distanceUpdated(_ nearbyObjects: [NINearbyObject]) {
+    guard let object = nearbyObjects.first, let distance = object.distance else { return }
+    sendEvent("distanceUpdated", [
+      "distanceCm": distance * 100,
+      "timestamp": Date().timeIntervalSince1970 * 1000,
+      "direction": object.direction.map { ["x": $0.x, "y": $0.y, "z": $0.z] } as Any
+    ])
+  }
+
+  fileprivate func sessionWasSuspended() {
+    sendEvent("connectionChanged", ["state": "recovering"])
+  }
+
+  fileprivate func sessionSuspensionEnded(_ session: NISession) {
+    guard let peer = selectedPeer, let token = session.discoveryToken else { return }
+
+    do {
+      let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+      try self.session?.send(data, toPeers: [peer], with: .reliable)
+    } catch {
+      fail(error, code: "recovery_failed")
+    }
+  }
+
+  fileprivate func nearbyInteractionInvalidated(_ error: Error) {
+    sendEvent("error", [
+      "code": "ni_invalidated",
+      "message": error.localizedDescription,
+      "recoverable": true
+    ])
+  }
 }
 
-extension ParallaxModule: MCNearbyServiceBrowserDelegate { public func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String : String]?) { peers[peerID.displayName] = peerID; sendEvent("peerDiscovered", ["id": peerID.displayName, "name": peerID.displayName]) }; public func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) { peers.removeValue(forKey: peerID.displayName) }; public func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) { fail(error, code: "discovery_failed") } }
-extension ParallaxModule: MCSessionDelegate { public func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) { let value = state == .connected ? "connected" : state == .connecting ? "connecting" : "disconnected"; sendEvent("connectionChanged", ["state": value]) }; public func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) { if let token = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: data) { niSession?.run(NINearbyPeerConfiguration(peerToken: token)) } }; public func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}; public func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, with progress: Progress) {}; public func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, at localURL: URL?, withError error: Error?) {} }
-extension ParallaxModule: NISessionDelegate { public func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) { guard let object = nearbyObjects.first, let distance = object.distance else { return }; sendEvent("distanceUpdated", ["distanceCm": distance * 100, "timestamp": Date().timeIntervalSince1970 * 1000, "direction": object.direction.map { ["x": $0.x, "y": $0.y, "z": $0.z] } as Any]) }; public func session(_ session: NISession, didUpdateAlgorithmConvergence convergence: NIAlgorithmConvergence) {}; public func sessionWasSuspended(_ session: NISession) { sendEvent("connectionChanged", ["state": "recovering"]) }; public func sessionSuspensionEnded(_ session: NISession) { if let peer = selectedPeer, let token = session.discoveryToken { self.session?.send(token.rawValue, toPeers: [peer], with: .reliable) } }; public func session(_ session: NISession, didInvalidateWith reason: NISessionInvalidationReason) { sendEvent("error", ["code": "ni_invalidated", "message": String(describing: reason), "recoverable": true]) } }
+private final class ParallaxMultipeerDelegate: NSObject,
+  MCNearbyServiceBrowserDelegate,
+  MCNearbyServiceAdvertiserDelegate,
+  MCSessionDelegate {
+  weak var owner: ParallaxModule?
+
+  init(owner: ParallaxModule) {
+    self.owner = owner
+  }
+
+  func browser(
+    _ browser: MCNearbyServiceBrowser,
+    foundPeer peerID: MCPeerID,
+    withDiscoveryInfo info: [String: String]?
+  ) {
+    owner?.foundPeer(peerID)
+  }
+
+  func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
+    owner?.lostPeer(peerID)
+  }
+
+  func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
+    owner?.fail(error, code: "discovery_failed")
+  }
+
+  func advertiser(
+    _ advertiser: MCNearbyServiceAdvertiser,
+    didReceiveInvitationFromPeer peerID: MCPeerID,
+    withContext context: Data?,
+    invitationHandler: @escaping (Bool, MCSession?) -> Void
+  ) {
+    owner?.acceptInvitation(from: peerID, invitationHandler)
+  }
+
+  func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
+    owner?.fail(error, code: "advertising_failed")
+  }
+
+  func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+    owner?.connectionChanged(state, peer: peerID)
+  }
+
+  func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+    owner?.receiveDiscoveryToken(data)
+  }
+
+  func session(
+    _ session: MCSession,
+    didReceive stream: InputStream,
+    withName streamName: String,
+    fromPeer peerID: MCPeerID
+  ) {}
+
+  func session(
+    _ session: MCSession,
+    didStartReceivingResourceWithName resourceName: String,
+    fromPeer peerID: MCPeerID,
+    with progress: Progress
+  ) {}
+
+  func session(
+    _ session: MCSession,
+    didFinishReceivingResourceWithName resourceName: String,
+    fromPeer peerID: MCPeerID,
+    at localURL: URL?,
+    withError error: Error?
+  ) {}
+}
+
+private final class ParallaxNearbyInteractionDelegate: NSObject, NISessionDelegate {
+  weak var owner: ParallaxModule?
+
+  init(owner: ParallaxModule) {
+    self.owner = owner
+  }
+
+  func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
+    owner?.distanceUpdated(nearbyObjects)
+  }
+
+  func session(
+    _ session: NISession,
+    didUpdateAlgorithmConvergence convergence: NIAlgorithmConvergence
+  ) {}
+
+  func sessionWasSuspended(_ session: NISession) {
+    owner?.sessionWasSuspended()
+  }
+
+  func sessionSuspensionEnded(_ session: NISession) {
+    owner?.sessionSuspensionEnded(session)
+  }
+
+  func session(_ session: NISession, didInvalidateWith error: Error) {
+    owner?.nearbyInteractionInvalidated(error)
+  }
+}

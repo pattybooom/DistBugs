@@ -12,7 +12,7 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "deploymentTarget": "16.0",
+      "deploymentTarget": "16.4",
       "bundleIdentifier": "com.patricksammm.parallax",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false

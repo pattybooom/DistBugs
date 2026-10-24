@@ -1,2 +1,12 @@
-const { withInfoPlist, withEntitlementsPlist } = require('@expo/config-plugins');
-module.exports = function withParallaxIos(config) { config = withInfoPlist(config, (config) => { config.modResults.NSLocalNetworkUsageDescription = 'Parallax uses the local network to discover nearby phones.'; config.modResults.NSBonjourServices = ['_parallax-uwb._tcp']; return config; }); return withEntitlementsPlist(config, (config) => { config.modResults['com.apple.developer.nearby-interaction'] = true; return config; }); };
+const { withInfoPlist } = require('@expo/config-plugins');
+
+module.exports = function withParallaxIos(config) {
+  return withInfoPlist(config, (config) => {
+    config.modResults.NSLocalNetworkUsageDescription =
+      'Parallax uses the local network to discover nearby phones.';
+    config.modResults.NSNearbyInteractionUsageDescription =
+      'Parallax uses Nearby Interaction to measure the distance between paired phones.';
+    config.modResults.NSBonjourServices = ['_parallax-uwb._tcp'];
+    return config;
+  });
+};
