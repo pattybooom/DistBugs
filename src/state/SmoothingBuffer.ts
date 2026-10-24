@@ -1,0 +1,1 @@
+export class SmoothingBuffer { private values: number[] = []; constructor(private readonly size = 7) {} push(value: number): number { this.values = [...this.values, value].slice(-this.size); return this.values.reduce((sum, item) => sum + item, 0) / this.values.length; } reset(): void { this.values = []; } }

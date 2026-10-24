@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "Parallax",
+    "slug": "parallax",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      "expo-dev-client",
+      "./plugins/withParallaxIos"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "deploymentTarget": "16.0",
+      "bundleIdentifier": "com.patricksammm.parallax"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.patricksammm.parallax"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}

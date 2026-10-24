@@ -1,0 +1,1 @@
+{"build":{"development":{"developmentClient":true,"distribution":"internal","ios":{"simulator":false}},"preview":{"distribution":"internal"}},"cli":{"version":">= 10.0.0"}}
