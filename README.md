@@ -1,4 +1,26 @@
-# Parallax M2
+# DistBugs
+
+An autonomous bug ecosystem for one phone. The player designs two starter bugs in the trait workshop and releases them into a habitat. From then on the bugs look after themselves: they search for food, eat, breed, age and die. Each phone keeps its own ecosystem; phones do not share anything.
+
+## Ecosystem
+
+- **Workshop.** Each starter has a look (body, eyes, horns, feature, colour palette) and a behaviour (speed, aggression, lifespan, hunger rate, food needed to breed). *Randomise* rolls a pair from the ecosystem's seed.
+- **Habitat.** A 360 × 520 unit rectangle, scaled to fit the screen. Food spawns about every 1.8 s (at most 14 at once) and expires after 20 s, blinking for its last 4 s.
+- **Behaviour.** A bug heads for the nearest food within 120 units, otherwise it wanders. Satiety (0–100) drains at the hunger rate, faster for fast and aggressive bugs, and each meal adds 30. A hungry bug that is clearly more aggressive (by 0.15 or more) chases a calmer one away.
+- **Life cycle.** A bug dies of old age at the end of its lifespan, or of starvation when satiety reaches 0. Once it has lived 15% of its lifespan, eaten its breeding threshold and has satiety of at least 35, it lays one offspring nearby (population cap 40). Newborns are drawn small and grow as they mature; old bugs fade; hungry bugs show a red bar.
+- **Inheritance.** Each behaviour trait drifts by at most one small mutation step per generation, within its range. One birth in 25 also changes the look slightly: a hue nudge (never past ±40°) or a step to the neighbouring feature. Body, eyes and horns are always inherited unchanged.
+- **Inspector.** Tap a bug to see its age, fullness, food towards its next offspring, each trait next to its parent's, any visual mutation, and its lineage.
+- **End.** When fewer than two bugs are left, the ecosystem ends and offers a new starter pair. It never invents a bug.
+
+Pacing is tuned so a bug's life takes 1–3 minutes: with the default starters the first offspring hatches after about 20 s and the first deaths come after 1–2 minutes.
+
+The simulation (`src/game/`) is plain TypeScript with no React Native imports. It is seeded (`Random.ts`, Mulberry32, whose state is saved with the ecosystem) and advances in fixed 50 ms steps (`stepSimulation`), so the same seed always plays out the same way and the tests can drive it directly. `SimulationDriver` turns frame time into steps (a long frame advances at most 0.25 s) and decides when to save. Sprites (`sprites.ts`) are assembled from hand-drawn pixel components and recoloured from the palette.
+
+The ecosystem is saved with AsyncStorage on every birth and death, at least every 15 s while running, when pausing, and when the app leaves the foreground. Leaving the foreground also pauses it, so no simulated time passes while the app is closed; on the next launch it is restored paused and *Resume* carries on.
+
+## Spatial Lab
+
+The original two-phone prototype is kept as a separate screen, opened with **Spatial Lab** from the ecosystem or the workshop. Leaving the lab disconnects from the other phone. The rest of this README describes it.
 
 Small Expo + TypeScript prototype for iPhone-to-iPhone Nearby Interaction. The native module owns MultipeerConnectivity, token exchange, NISession lifecycle, recovery, Core Motion, peer telemetry, and structured diagnostics. The TypeScript layer owns spatial transforms, smoothing, position validity, and presentation.
 
@@ -25,7 +47,7 @@ eas build --profile development --platform ios
 
 Register both physical iPhones with `eas device:create` (or the EAS dashboard). No USB cable is required: each phone opens the generated registration URL, installs the device profile, and EAS includes the registered UDID in the ad hoc build. Install the resulting build from its EAS-generated URL. The broken Lightning port is therefore not a blocker.
 
-After the development build is installed, run `npx expo start --dev-client`; TypeScript UI, smoothing, layout, and visualization changes use Fast Refresh. Rebuild only after changing `modules/parallax-module`, `plugins/withParallaxIos`, iOS permissions, entitlements, or other native configuration.
+After the development build is installed, run `npx expo start --dev-client`; TypeScript UI, smoothing, layout, and visualization changes use Fast Refresh. Rebuild only after changing native dependencies (such as AsyncStorage), `modules/parallax-module`, `plugins/withParallaxIos`, iOS permissions, entitlements, or other native configuration.
 
 ## M2 spatial acceptance checklist
 

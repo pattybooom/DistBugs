@@ -1,0 +1,151 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+import { loadSimulation, saveSimulation } from '../game/persistence';
+import { createSimulation, defaultStarterTraits, releaseStarters, restartEcosystem, rollStarterTraits } from '../game/Simulation';
+import { SimulationDriver } from '../game/SimulationDriver';
+import { DeathCause, SimulationEvent, SimulationState, TraitSet } from '../game/types';
+
+/** About 30 redraws a second; the simulation itself steps at its own fixed rate. */
+const RENDER_INTERVAL_MS = 33;
+const LOG_LENGTH = 4;
+
+export type LogEntry = { id: number; text: string; tone: 'birth' | 'death' | 'info' };
+export type Obituary = { name: string; cause: DeathCause; ageS: number };
+
+export type Ecosystem = {
+  loaded: boolean;
+  /** Mutated in place by the simulation; `frame` changes whenever it should be redrawn. */
+  state: SimulationState | null;
+  frame: number;
+  running: boolean;
+  log: LogEntry[];
+  obituaries: Record<string, Obituary>;
+  release: (starters: [TraitSet, TraitSet]) => void;
+  restart: () => void;
+  setPaused: (paused: boolean) => void;
+  rollStarters: () => [TraitSet, TraitSet];
+};
+
+const save = (state: SimulationState) => {
+  saveSimulation(AsyncStorage, state).catch((error) => console.warn('Could not save the ecosystem', error));
+};
+
+/**
+ * Owns this phone's ecosystem: loads it, runs it while `visible` and the app is in the
+ * foreground, and saves it. Leaving the foreground pauses it.
+ */
+export function useEcosystem(visible: boolean): Ecosystem {
+  const driverRef = useRef<SimulationDriver | null>(null);
+  const obituaries = useRef<Record<string, Obituary>>({});
+  const nextLogId = useRef(1);
+  const [loaded, setLoaded] = useState(false);
+  const [frame, setFrame] = useState(0);
+  const [log, setLog] = useState<LogEntry[]>([]);
+
+  const refresh = useCallback(() => setFrame((current) => current + 1), []);
+  const addLog = useCallback((entries: Omit<LogEntry, 'id'>[]) => {
+    if (entries.length === 0) return;
+    const numbered = entries.map((entry) => ({ ...entry, id: nextLogId.current++ }));
+    setLog((current) => [...numbered.reverse(), ...current].slice(0, LOG_LENGTH));
+  }, []);
+
+  const record = useCallback((events: SimulationEvent[]) => {
+    const entries: Omit<LogEntry, 'id'>[] = [];
+    for (const event of events) {
+      if (event.type === 'born') {
+        entries.push({ text: `${event.name} hatched · gen ${event.generation}${event.visualMutation ? ' · new look!' : ''}`, tone: 'birth' });
+      } else if (event.type === 'died') {
+        obituaries.current[event.bugId] = { name: event.name, cause: event.cause, ageS: event.ageS };
+        entries.push({ text: `${event.name} ${event.cause === 'starvation' ? 'starved' : 'died of old age'} at ${Math.round(event.ageS)} s`, tone: 'death' });
+      } else if (event.type === 'ecosystem-ended') {
+        entries.push({ text: event.survivors === 1 ? 'One bug left: the ecosystem has ended' : 'No bugs left: the ecosystem has ended', tone: 'info' });
+      }
+    }
+    addLog(entries);
+  }, [addLog]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSimulation(AsyncStorage)
+      .catch((error) => {
+        console.warn('Could not load the saved ecosystem', error);
+        return null;
+      })
+      .then((saved) => {
+        if (cancelled) return;
+        const driver = new SimulationDriver(saved ?? createSimulation(Date.now() % 2 ** 32), save);
+        driver.setAppActive(AppState.currentState === 'active');
+        driverRef.current = driver;
+        if (saved?.status === 'running') addLog([{ text: 'Restored · paused while the app was closed', tone: 'info' }]);
+        setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [addLog]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      driverRef.current?.setAppActive(next === 'active');
+      refresh();
+    });
+    return () => subscription.remove();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!visible || !loaded) return;
+    let handle = 0;
+    let lastMs: number | null = null;
+    let lastRenderMs = 0;
+    const tick = (nowMs: number) => {
+      const driver = driverRef.current;
+      if (driver) {
+        const events = driver.advance(lastMs == null ? 0 : (nowMs - lastMs) / 1000);
+        lastMs = nowMs;
+        if (events.length > 0) record(events);
+        if ((driver.running && nowMs - lastRenderMs >= RENDER_INTERVAL_MS) || events.some((event) => event.type === 'ecosystem-ended')) {
+          lastRenderMs = nowMs;
+          refresh();
+        }
+      }
+      handle = requestAnimationFrame(tick);
+    };
+    handle = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(handle);
+      driverRef.current?.saveNow();
+    };
+  }, [visible, loaded, record, refresh]);
+
+  const withDriver = (fn: (driver: SimulationDriver) => void) => {
+    const driver = driverRef.current;
+    if (!driver) return;
+    fn(driver);
+    refresh();
+  };
+
+  return {
+    loaded,
+    state: driverRef.current?.state ?? null,
+    frame,
+    running: driverRef.current?.running ?? false,
+    log,
+    obituaries: obituaries.current,
+    release: (starters) => withDriver((driver) => {
+      releaseStarters(driver.state, starters);
+      driver.saveNow();
+      obituaries.current = {};
+      setLog([]);
+      addLog([{ text: 'Starters released into the habitat', tone: 'info' }]);
+    }),
+    restart: () => withDriver((driver) => {
+      restartEcosystem(driver.state);
+      driver.saveNow();
+      obituaries.current = {};
+      setLog([]);
+    }),
+    setPaused: (paused) => withDriver((driver) => driver.setPaused(paused)),
+    rollStarters: () => driverRef.current ? rollStarterTraits(driverRef.current.state) : defaultStarterTraits(),
+  };
+}
