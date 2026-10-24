@@ -153,6 +153,29 @@ export function fitSpin(samples: readonly SpinSample[], turnedRad = 0): SpinFit 
   return fit;
 }
 
+const SHARED_SPIN_TYPE = 'spinFits';
+
+/** Message for the other phone, so one spin places both phones on both screens. */
+export function serializeSpinFits(fits: Partial<Record<'A' | 'B', SpinFit>>): string {
+  return JSON.stringify({ type: SHARED_SPIN_TYPE, version: 1, fits });
+}
+
+/** Reads a spin result sent by the other phone; JSON turns an infinite uncertainty into null. */
+export function parseSharedSpinFits(message: string): Partial<Record<'A' | 'B', SpinFit>> | null {
+  try {
+    const parsed = JSON.parse(message) as { type?: unknown; fits?: Record<string, unknown> };
+    if (parsed.type !== SHARED_SPIN_TYPE || !parsed.fits || typeof parsed.fits !== 'object') return null;
+    const fits: Partial<Record<'A' | 'B', SpinFit>> = {};
+    (['A', 'B'] as const).forEach((role) => {
+      const fit = parsed.fits?.[role] as SpinFit | undefined;
+      if (fit && typeof fit.accepted === 'boolean' && typeof fit.reason === 'string') fits[role] = fit;
+    });
+    return fits;
+  } catch {
+    return null;
+  }
+}
+
 /** Rotation that takes Phone B's reference frame into Phone A's, from a spin on each phone. */
 export function spinFrameOffset(fitA: SpinFit | undefined, fitB: SpinFit | undefined): number | null {
   if (!fitA?.accepted || !fitB?.accepted || fitA.bearingRad == null || fitB.bearingRad == null) return null;

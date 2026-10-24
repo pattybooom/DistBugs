@@ -55,6 +55,15 @@ export type MotionEvent = {
   valid: boolean;
   timestamp: number;
   motionTimestamp?: number;
+  /** Acceleration with gravity removed, in g, device axes. */
+  userAcceleration?: Vector3;
+  /** The phone's own dead-reckoned slide since motion started, in its reference frame, in cm. */
+  displacementCm?: Vector3;
+  stationary?: boolean;
+  /** Total time spent moving since motion started, in seconds. */
+  movingSeconds?: number;
+  /** Start time of the phone's Core Motion run; a new value means its yaw zero moved. Missing from older builds. */
+  frameId?: number;
   /** Set in JavaScript on arrival, using this phone's clock; native code never sends it. */
   receivedAt?: number;
 };
@@ -69,6 +78,7 @@ export type NativeCapabilities = {
   cameraAssistance: 'not_used';
 };
 
+export type PeerMessageEvent = { peerId?: string; message: string };
 export type ParallaxError = { code: string; message: string; recoverable: boolean };
 export type DiagnosticEvent = { stage: string; message: string; timestamp: number };
 
@@ -80,6 +90,8 @@ type NativeApi = {
   startRanging(): Promise<void>;
   stopRanging(): Promise<void>;
   getCapabilities(): Promise<NativeCapabilities>;
+  /** Missing from builds made before peer messages existed. */
+  sendPeerMessage?(message: string): Promise<void>;
   addListener(event: string, listener: (payload: unknown) => void): EventSubscription;
 };
 
@@ -107,7 +119,11 @@ export default {
   onPeerDiscovered: (cb: (peer: Peer) => void) => subscribe('peerDiscovered', cb),
   onConnectionChanged: (cb: (event: ConnectionChangedEvent | ConnectionState) => void) => subscribe('connectionChanged', cb),
   onDistanceUpdated: (cb: (event: DistanceEvent) => void) => subscribe('distanceUpdated', cb),
+  sendPeerMessage: (message: string) => native?.sendPeerMessage
+    ? native.sendPeerMessage(message)
+    : Promise.reject(new Error('This build cannot message the other phone; install a new development build')),
   onMotionUpdated: (cb: (event: MotionEvent) => void) => subscribe('motionUpdated', cb),
+  onPeerMessage: (cb: (event: PeerMessageEvent) => void) => subscribe('peerMessage', cb),
   onError: (cb: (error: ParallaxError) => void) => subscribe('error', cb),
   onDiagnostic: (cb: (event: DiagnosticEvent) => void) => subscribe('diagnostic', cb),
 };

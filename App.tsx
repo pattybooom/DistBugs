@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { SafeAreaView, ScrollView, Share, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { GestureResponderEvent, SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import ParallaxModule, {
   ConnectionState,
   DistanceEvent,
@@ -13,24 +13,36 @@ import ParallaxModule, {
   Vector3,
 } from './src/native/ParallaxModule';
 import {
-  calculateRelativeRotation,
-  hasCommonFrame,
   isFresh,
   PositionEstimate,
-  selectPositionMeasurement,
-  STALE_AFTER_MS,
   tablePlaneHeading,
   transformDirectionToReferenceFrame,
   wrapAngle,
 } from './src/spatial/SpatialMath';
 import { layoutPhonePair, PHONE_SIZE_CM, rotatePosition, ScenePoint, viewRotation } from './src/spatial/SceneLayout';
-import { selectSpinPosition, SpinFit, spinFrameOffset, SpinRecording, SpinSample } from './src/spatial/SpinBearing';
-import { SmoothingBuffer } from './src/state/SmoothingBuffer';
-
-type PhoneRole = 'A' | 'B';
+import {
+  classifySwipe,
+  computeStitch,
+  matchSwipes,
+  MOVED_THRESHOLD_CM,
+  MovedApartCheck,
+  parseStitchMessage,
+  PhoneRole,
+  predictedAntennaDistanceCm,
+  serializeStitchMessage,
+  StitchMessage,
+  StitchState,
+  stitchedLayout,
+  SwipeReport,
+  TouchSample,
+} from './src/spatial/Stitch';
+import { DistanceFilter, FilteredDistance } from './src/state/DistanceFilter';
 
 const CONNECTION_STATES: ConnectionState[] = ['disconnected', 'connecting', 'connected', 'recovering'];
-const PHONE_ROLES: PhoneRole[] = ['A', 'B'];
+/** Swipe halves older than this can no longer pair with a new one. */
+const SWIPE_REPORT_LIFETIME_MS = 3000;
+/** Gives the other phone a moment to finish connecting before both send their Nearby Interaction tokens. */
+const AUTO_RANGING_DELAY_MS = 500;
 const SCENE_WIDTH = 340;
 const SCENE_HEIGHT = 410;
 const ORIGIN_X = SCENE_WIDTH / 2;
@@ -40,11 +52,6 @@ const MAX_PIXELS_PER_CM = 5.5;
 /** Both phone outlines are kept within this many pixels of the origin by shrinking the scale. */
 const SCENE_REACH_PX = 150;
 const PHONE_HALF_DIAGONAL_CM = Math.hypot(PHONE_SIZE_CM.widthCm, PHONE_SIZE_CM.lengthCm) / 2;
-/** Local distance and motion events for one UWB sample are sent together; allow for delivery jitter. */
-const SPIN_PAIRING_WINDOW_MS = 100;
-const SPIN_TIMEOUT_MS = 60_000;
-const SPIN_PLOT_WIDTH = 300;
-const SPIN_PLOT_HEIGHT = 90;
 const RAD_TO_DEG = 180 / Math.PI;
 
 const readConnectionState = (value: unknown): ConnectionState | null => {
@@ -65,6 +72,15 @@ const readSessionState = (value: unknown): SpatialSessionState | null =>
   value && typeof value === 'object' && 'sessionState' in value && typeof (value as { sessionState?: unknown }).sessionState === 'string'
     ? (value as { sessionState: SpatialSessionState }).sessionState
     : null;
+
+const readRole = (value: unknown): PhoneRole | null => {
+  const role = value && typeof value === 'object' && 'role' in value ? (value as { role?: unknown }).role : null;
+  return role === 'A' || role === 'B' ? role : null;
+};
+
+const headingOf = (motion: MotionEvent | null | undefined): number | null => tablePlaneHeading(motion?.attitudeQuaternion);
+
+const EMPTY_DISTANCE: FilteredDistance = { rawCm: null, smoothedCm: null, role: null, fresh: false };
 
 const formatVector = (vector?: Vector3 | null): string =>
   vector ? `[${vector.x.toFixed(2)}, ${vector.y.toFixed(2)}, ${vector.z.toFixed(2)}]` : '—';
@@ -132,13 +148,18 @@ function PositionScene({
   position,
   headingA,
   headingB,
+  note,
+  stale = false,
 }: {
   position: PositionEstimate;
   headingA: number | null;
   headingB: number | null;
+  note?: string | null;
+  /** Phone B was placed by a join that no longer holds; it is drawn dashed. */
+  stale?: boolean;
 }) {
-  const estimated = position.source === 'estimated';
-  const layout = position.source === 'measured' || estimated ? layoutPhonePair(position, headingA, headingB) : null;
+  const estimated = position.source === 'estimated' || stale;
+  const layout = position.source === 'measured' || position.source === 'stitched' || estimated ? layoutPhonePair(position, headingA, headingB) : null;
   // Phones are drawn to scale; the scale shrinks until both outlines fit.
   const extentCm = (layout ? Math.max(Math.abs(layout.centreB.xCm), Math.abs(layout.centreB.yCm)) : 0) + PHONE_HALF_DIAGONAL_CM;
   const pixelsPerCm = Math.min(MAX_PIXELS_PER_CM, SCENE_REACH_PX / extentCm);
@@ -149,7 +170,7 @@ function PositionScene({
   const gapStart = layout && toScreen(layout.gapStart);
   const gapEnd = layout && toScreen(layout.gapEnd);
   const gapPx = layout ? layout.gapCm * pixelsPerCm : 0;
-  const notes = [estimated && 'SPIN ESTIMATE', layout && headingB == null && 'B ROTATION UNKNOWN'].filter(Boolean).join(' · ');
+  const notes = [layout && note, layout && headingB == null && 'B ROTATION UNKNOWN'].filter(Boolean).join(' · ');
 
   return (
     <View style={styles.scene}>
@@ -187,7 +208,7 @@ function PositionScene({
         <Text style={styles.sceneFooterText}>
           {layout
             ? `${formatDistance(layout.distanceCm)} CENTRE TO CENTRE · ${layout.touching ? 'TOUCHING' : `GAP ${formatDistance(layout.gapCm)}`}${notes ? ` · ${notes}` : ''}`
-            : 'Waiting for measured direction or a spin test'}
+            : 'Waiting for a swipe across both screens'}
         </Text>
         <Text style={styles.sceneScaleText}>{`PHONES TO SCALE · 10 cm = ${Math.round(pixelsPerCm * 10)} px · +Y = PHONE A AT START`}</Text>
       </View>
@@ -228,71 +249,78 @@ function RoleDiagnostics({
       <DiagnosticRow label={`${role} WORLD GRAVITY`} value={formatVector(worldGravity)} tone={worldGravity ? (worldGravity.z < -0.95 ? 'good' : 'warn') : 'normal'} />
       <DiagnosticRow label={`${role} ANGULAR VELOCITY`} value={formatVector(motion?.angularVelocity)} />
       <DiagnosticRow label={`${role} FRAME`} value={formatFrame(motion?.referenceFrame)} />
+      <DiagnosticRow
+        label={`${role} SLIDE`}
+        value={motion?.displacementCm
+          ? `${motion.stationary ? 'STILL' : 'MOVING'} · ${formatVector(motion.displacementCm)} cm · ${(motion.movingSeconds ?? 0).toFixed(1)} s MOVING`
+          : '—'}
+      />
+      <DiagnosticRow label={`${role} USER ACCEL`} value={formatVector(motion?.userAcceleration)} />
       <DiagnosticRow label={`${role} READING AGE`} value={formatAge(measurement?.receivedAt, now)} />
     </>
   );
 }
 
-function SpinDiagnostics({
+/**
+ * Full-screen catcher for the join swipe. Both phones show it at once; the finger's trail on
+ * each screen is read for where it left or arrived, and Phone A pairs the two halves.
+ */
+function JoinOverlay({
   role,
-  fit,
-  recording,
-  active,
+  note,
+  status,
+  onSwipe,
+  onClose,
 }: {
-  role: PhoneRole;
-  fit: SpinFit | undefined;
-  recording: SpinRecording;
-  active: boolean;
+  role: PhoneRole | null;
+  note: string | null;
+  status: string;
+  onSwipe: (trail: TouchSample[], startedAt: number, endedAt: number) => void;
+  onClose: () => void;
 }) {
-  if (active) {
-    return <DiagnosticRow label={`${role} SPIN`} value={`RECORDING · ${formatDegrees(recording.turnedRad)} TURNED · ${recording.sampleCount} READINGS`} />;
-  }
-  if (!fit) return <DiagnosticRow label={`${role} SPIN`} value="NOT RUN" />;
-  return (
-    <>
-      <DiagnosticRow label={`${role} SPIN`} value={`${fit.accepted ? 'ACCEPTED' : 'REJECTED'} · ${fit.reason.toUpperCase()}`} tone={fit.accepted ? 'good' : 'warn'} />
-      <DiagnosticRow label={`${role} SPIN COVERAGE`} value={`${formatDegrees(fit.turnedRad)} TURNED · ${fit.sampleCount} READINGS`} />
-      <DiagnosticRow
-        label={`${role} SPIN WAVE`}
-        value={fit.amplitudeCm == null
-          ? '—'
-          : `${fit.amplitudeCm.toFixed(1)} cm · NOISE ${fit.residualCm?.toFixed(1)} cm · QUALITY ${Math.round((fit.quality ?? 0) * 100)}%`}
-      />
-      <DiagnosticRow
-        label={`${role} SPIN BEARING`}
-        value={fit.bearingRad == null
-          ? '—'
-          : `${formatDegrees(fit.bearingRad)} ± ${formatDegrees(fit.bearingUncertaintyRad)} (CLOSEST AT ${formatDegrees(fit.closestHeadingRad)})`}
-      />
-      <SpinPlot samples={recording.samples} fit={fit} />
-    </>
-  );
-}
-
-/** Distance against heading for the last spin, with the fitted drift removed and the fitted wave overlaid. */
-function SpinPlot({ samples, fit }: { samples: readonly SpinSample[]; fit: SpinFit }) {
-  const { meanCm, amplitudeCm, closestHeadingRad } = fit;
-  if (samples.length === 0 || meanCm == null || amplitudeCm == null || closestHeadingRad == null) return null;
-  const startT = samples[0].t;
-  const drift = fit.driftCmPerSecond ?? 0;
-  const points = samples.map(({ t, heading, distanceCm }) => ({ heading: wrapAngle(heading), distanceCm: distanceCm - (drift * (t - startT)) / 1000 }));
-  const curve = Array.from({ length: 72 }, (_, index) => {
-    const heading = -Math.PI + (2 * Math.PI * index) / 71;
-    return { heading, distanceCm: meanCm - amplitudeCm * Math.cos(heading - closestHeadingRad) };
+  const trail = useRef<TouchSample[]>([]);
+  const startedAt = useRef(0);
+  const sample = (event: GestureResponderEvent): TouchSample => ({
+    xPt: event.nativeEvent.pageX,
+    yPt: event.nativeEvent.pageY,
+    tMs: event.nativeEvent.timestamp,
   });
-  const distances = [...points, ...curve].map(({ distanceCm }) => distanceCm);
-  const low = Math.min(...distances);
-  const span = Math.max(1, Math.max(...distances) - low);
-  const left = (heading: number) => ((heading + Math.PI) / (2 * Math.PI)) * (SPIN_PLOT_WIDTH - 4);
-  const top = (distanceCm: number) => (1 - (distanceCm - low) / span) * (SPIN_PLOT_HEIGHT - 4);
+  const finish = () => {
+    const samples = trail.current;
+    trail.current = [];
+    if (samples.length > 1) onSwipe(samples, startedAt.current, Date.now());
+  };
 
   return (
-    <View>
-      <View style={styles.spinPlot}>
-        {curve.map((point, index) => <View key={`curve-${index}`} style={[styles.spinCurveDot, { left: left(point.heading), top: top(point.distanceCm) }]} />)}
-        {points.map((point, index) => <View key={`sample-${index}`} style={[styles.spinSampleDot, { left: left(point.heading), top: top(point.distanceCm) }]} />)}
+    <View
+      style={styles.joinOverlay}
+      onStartShouldSetResponder={() => true}
+      onMoveShouldSetResponder={() => true}
+      onResponderTerminationRequest={() => false}
+      onResponderGrant={(event) => {
+        startedAt.current = Date.now();
+        trail.current = [sample(event)];
+      }}
+      onResponderMove={(event) => { trail.current.push(sample(event)); }}
+      onResponderRelease={(event) => {
+        trail.current.push(sample(event));
+        finish();
+      }}
+      onResponderTerminate={finish}
+    >
+      <View pointerEvents="none" style={styles.joinCopy}>
+        <Text style={styles.eyebrow}>{role ? `PHONE ${role}` : 'NOT CONNECTED'}</Text>
+        <Text style={styles.joinTitle}>Swipe across{'\n'}both screens</Text>
+        <Text style={styles.joinChevrons}>›  ›  ›</Text>
+        <Text style={styles.joinHint}>
+          Lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.
+        </Text>
+        <Text style={styles.joinStatus}>{status}</Text>
+        {note && <Text style={styles.joinNote}>{note}</Text>}
       </View>
-      <Text style={styles.spinPlotLabel}>{`HEADING −180° → 180° · ${Math.round(span)} cm TOP TO BOTTOM`}</Text>
+      <TouchableOpacity style={styles.joinClose} onPress={onClose}>
+        <Text style={styles.secondaryText}>Not now</Text>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -300,37 +328,89 @@ function SpinPlot({ samples, fit }: { samples: readonly SpinSample[]; fit: SpinF
 export default function App() {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [connection, setConnection] = useState<ConnectionState>('disconnected');
+  const [localRole, setLocalRole] = useState<PhoneRole | null>(null);
   const [measurements, setMeasurements] = useState<Partial<Record<DeviceRole, DistanceEvent>>>({});
   const [motions, setMotions] = useState<Partial<Record<DeviceRole, MotionEvent>>>({});
   const [capabilities, setCapabilities] = useState<NativeCapabilities | null>(null);
-  const [smoothedDistance, setSmoothedDistance] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [logs, setLogs] = useState<string[]>(['Parallax M2 ready — Phone A is the connection initiator.']);
-  const [smoother] = useState(() => new SmoothingBuffer(5));
   const [sessionState, setSessionState] = useState<SpatialSessionState | null>(null);
-  const [spinStartedAt, setSpinStartedAt] = useState<number | null>(null);
-  const [spinFits, setSpinFits] = useState<Partial<Record<PhoneRole, SpinFit>>>({});
+  const [stitchState, setStitchState] = useState<StitchState | null>(null);
+  const [joinOpen, setJoinOpen] = useState(false);
+  const [joinNote, setJoinNote] = useState<string | null>(null);
+  const [uwbResidualCm, setUwbResidualCm] = useState<number | null>(null);
   /** Phone A's heading when its first motion reading arrived; the map draws it pointing up. */
   const [upHeading, setUpHeading] = useState<number | null>(null);
-  const measurementsRef = useRef<Partial<Record<PhoneRole, DistanceEvent>>>({});
-  const spinRecordings = useRef<Record<PhoneRole, SpinRecording>>({ A: new SpinRecording(), B: new SpinRecording() });
-  const spinPairedAt = useRef<Partial<Record<PhoneRole, number>>>({});
-  const spinActiveRef = useRef(false);
+  // Native callbacks are subscribed once, so they read the latest values through refs.
+  const distanceFilter = useRef(new DistanceFilter());
+  const movedCheck = useRef(new MovedApartCheck());
+  const localRoleRef = useRef<PhoneRole | null>(null);
+  const motionsRef = useRef<Partial<Record<PhoneRole, MotionEvent>>>({});
+  const stitchRef = useRef<StitchState | null>(null);
+  const swipeReports = useRef<SwipeReport[]>([]);
+  const rangingRequested = useRef(false);
+  const screen = useWindowDimensions();
 
   const addLog = (message: string) => setLogs((current) => [message, ...current].slice(0, 32));
+  const reportActionError = (error: unknown) => addLog(`Error: ${error instanceof Error ? error.message : String(error)}`);
+  const sendStitchMessage = (message: StitchMessage) => {
+    void ParallaxModule.sendPeerMessage(serializeStitchMessage(message)).catch(reportActionError);
+  };
+
+  const applyStitchState = (state: StitchState | null) => {
+    if (state?.stitch.id !== stitchRef.current?.stitch.id) {
+      movedCheck.current.reset();
+      setUwbResidualCm(null);
+    }
+    stitchRef.current = state;
+    setStitchState(state);
+    if (state) setJoinOpen(state.status !== 'joined');
+  };
+
+  // Phone A owns the join: it pairs swipe halves, decides when the join is lost, and tells Phone B.
+  const publishStitchState = (state: StitchState) => {
+    applyStitchState(state);
+    sendStitchMessage({ type: 'state', state });
+  };
+
+  const markMoved = (reason: string) => {
+    const current = stitchRef.current;
+    if (!current || current.status !== 'joined' || localRoleRef.current !== 'A') return;
+    publishStitchState({ ...current, status: 'moved', reason });
+    addLog(`Join lost: ${reason}`);
+  };
+
+  const addSwipeReport = (report: SwipeReport) => {
+    const at = Date.now();
+    swipeReports.current = [...swipeReports.current.filter((item) => at - item.atMs < SWIPE_REPORT_LIFETIME_MS), report];
+    const match = matchSwipes(swipeReports.current);
+    if (!match) return;
+    swipeReports.current = [];
+    const result = computeStitch(match.exit, match.entry, at);
+    if (!result.stitch) {
+      setJoinNote(`Join failed: ${result.reason}`);
+      addLog(`Join failed: ${result.reason}`);
+      return;
+    }
+    publishStitchState({ stitch: result.stitch, status: 'joined' });
+    setJoinNote(null);
+    const { stitch } = result;
+    addLog(`Joined by a swipe from Phone ${stitch.from} · B turned ${formatDegrees(stitch.relativeYawRad)}${stitch.snapped ? ' (square)' : ''}`);
+  };
+
+  /** UWB is only a tripwire: it compares its change since the join with the change rotation explains. */
+  const checkMoved = (filtered: FilteredDistance, at: number) => {
+    const state = stitchRef.current;
+    if (!state || state.status !== 'joined' || filtered.smoothedCm == null) return;
+    const placed = stitchedLayout(state.stitch, headingOf(motionsRef.current.A), headingOf(motionsRef.current.B));
+    if (placed.headingA == null || placed.headingB == null) return;
+    const predictedCm = predictedAntennaDistanceCm(state.stitch, placed.headingA, placed.headingB);
+    const { residualCm, moved } = movedCheck.current.observe(filtered.smoothedCm, predictedCm, at);
+    setUwbResidualCm(residualCm);
+    if (moved && residualCm != null) markMoved(`UWB distance changed by ${Math.round(residualCm)} cm`);
+  };
 
   useEffect(() => {
-    // Native code sends each UWB sample's distance just before its motion, both timed by the measuring phone.
-    const recordSpinSample = (role: PhoneRole, motion: MotionEvent) => {
-      const measurement = measurementsRef.current[role];
-      const heading = tablePlaneHeading(motion.attitudeQuaternion);
-      if (!measurement?.distanceAvailable || measurement.distanceCm == null || heading == null) return;
-      if (Math.abs(measurement.measurementTimestamp - motion.timestamp) > SPIN_PAIRING_WINDOW_MS) return;
-      if (spinPairedAt.current[role] === measurement.measurementTimestamp) return;
-      spinPairedAt.current[role] = measurement.measurementTimestamp;
-      spinRecordings.current[role].add(motion.timestamp, heading, measurement.distanceCm);
-    };
-
     const subscriptions = [
       ParallaxModule.onPeerDiscovered((peer) => {
         setPeers((current) => current.some((item) => item.id === peer.id) ? current : [...current, peer]);
@@ -338,31 +418,66 @@ export default function App() {
       }),
       ParallaxModule.onConnectionChanged((event) => {
         const state = readConnectionState(event);
-        if (state) {
-          setConnection(state);
-          setSessionState(readSessionState(event));
-          // A new connection restarts the motion frames, so earlier spin bearings no longer apply.
-          if (state === 'disconnected') {
-            setSpinFits({});
-            setUpHeading(null);
-          }
-          addLog(`Connection: ${state}`);
-        } else addLog('Error: invalid connection status from native code');
+        if (!state) {
+          addLog('Error: invalid connection status from native code');
+          return;
+        }
+        setConnection(state);
+        setSessionState(readSessionState(event));
+        const role = readRole(event);
+        localRoleRef.current = role;
+        setLocalRole(role);
+        if (state === 'connected' && !rangingRequested.current) {
+          rangingRequested.current = true;
+          if (stitchRef.current?.status !== 'joined') setJoinOpen(true);
+          // Each phone sends its own token and needs the other's, so both start ranging.
+          setTimeout(() => { void ParallaxModule.startRanging().catch(reportActionError); }, AUTO_RANGING_DELAY_MS);
+        }
+        if (state === 'disconnected') {
+          rangingRequested.current = false;
+          distanceFilter.current.reset();
+          swipeReports.current = [];
+          applyStitchState(null);
+          setJoinOpen(false);
+          setUpHeading(null);
+        }
+        addLog(`Connection: ${state}`);
       }),
       ParallaxModule.onDistanceUpdated((event) => {
         const role = event.role;
-        if (role === 'A' || role === 'B') {
-          const received = { ...event, receivedAt: Date.now() };
-          measurementsRef.current = { ...measurementsRef.current, [role]: received };
-          setMeasurements((current) => ({ ...current, [role]: received }));
-        }
         if (event.directionAvailable && !event.directionValid) addLog('Direction reported but rejected as invalid');
+        if (role !== 'A' && role !== 'B') return;
+        const receivedAt = Date.now();
+        setMeasurements((current) => ({ ...current, [role]: { ...event, receivedAt } }));
+        if (!event.distanceAvailable || event.distanceCm == null) return;
+        // Every reading advances the filter, even a repeat of the last value.
+        if (!distanceFilter.current.push({ role, distanceCm: event.distanceCm, receivedAt }, localRoleRef.current)) return;
+        const filtered = distanceFilter.current.current(receivedAt);
+        checkMoved(filtered, receivedAt);
       }),
       ParallaxModule.onMotionUpdated((event) => {
         const role = event.role;
         if (role !== 'A' && role !== 'B') return;
-        setMotions((current) => ({ ...current, [role]: { ...event, receivedAt: Date.now() } }));
-        if (spinActiveRef.current) recordSpinSample(role, event);
+        const received = { ...event, receivedAt: Date.now() };
+        motionsRef.current = { ...motionsRef.current, [role]: received };
+        setMotions((current) => ({ ...current, [role]: received }));
+        // A restarted motion frame has a new yaw zero, so the join's heading offset no longer applies.
+        const joinedFrame = stitchRef.current?.stitch.frameIds[role];
+        if (joinedFrame != null && event.frameId != null && event.frameId !== joinedFrame) markMoved(`motion restarted on Phone ${role}`);
+      }),
+      ParallaxModule.onPeerMessage((event) => {
+        const message = parseStitchMessage(event.message);
+        if (!message) return;
+        if (message.type === 'swipe') {
+          // The other phone says how long ago the finger crossed; Multipeer latency is ignored.
+          if (localRoleRef.current === 'A') addSwipeReport({ ...message.report, atMs: Date.now() - message.ageMs });
+        } else if (message.type === 'state') {
+          if (localRoleRef.current === 'A') return;
+          applyStitchState(message.state);
+          addLog(message.state?.status === 'joined' ? 'Joined (from Phone A)' : `Join lost: ${message.state?.reason ?? 'cleared'}`);
+        } else {
+          setJoinOpen(true);
+        }
       }),
       ParallaxModule.onError((error) => addLog(`Error ${error.code}: ${error.message}`)),
       ParallaxModule.onDiagnostic((event) => addLog(`[${event.stage}] ${event.message}`)),
@@ -381,238 +496,216 @@ export default function App() {
     };
   }, []);
 
+  const handleSwipe = (trail: TouchSample[], startedAt: number, endedAt: number) => {
+    const role = localRoleRef.current;
+    if (!role) {
+      setJoinNote('Connect the phones first');
+      return;
+    }
+    const { exit, entry } = classifySwipe(trail, { widthPt: screen.width, heightPt: screen.height });
+    const own = motionsRef.current[role];
+    const base = { role, headingRad: headingOf(own), frameId: own?.frameId ?? null };
+    const reports: SwipeReport[] = [
+      ...(exit ? [{ ...exit, ...base, kind: 'exit' as const, atMs: endedAt }] : []),
+      ...(entry ? [{ ...entry, ...base, kind: 'entry' as const, atMs: startedAt }] : []),
+    ];
+    setJoinNote(reports.length === 0
+      ? 'Not counted: start or finish on an edge, and keep the finger moving'
+      : reports.map((report) => report.kind === 'exit' ? `Left across the ${report.edge} edge` : `Arrived across the ${report.edge} edge`).join(' · '));
+    if (role === 'A') reports.forEach(addSwipeReport);
+    else reports.forEach(({ atMs, ...report }) => sendStitchMessage({ type: 'swipe', report, ageMs: Date.now() - atMs }));
+  };
+
+  const requestJoin = () => {
+    setJoinNote(null);
+    setJoinOpen(true);
+    sendStitchMessage({ type: 'join' });
+  };
+
   const measurementA = measurements.A ?? null;
   const measurementB = measurements.B ?? null;
   const motionA = motions.A ?? null;
   const motionB = motions.B ?? null;
-  const distanceCm = measurementA?.distanceCm ?? measurementB?.distanceCm ?? null;
-
-  useEffect(() => {
-    if (distanceCm != null && Number.isFinite(distanceCm) && distanceCm >= 0) setSmoothedDistance(smoother.push(distanceCm));
-    else {
-      smoother.reset();
-      setSmoothedDistance(null);
-    }
-  }, [distanceCm, smoother]);
-
-  const startSpin = () => {
-    PHONE_ROLES.forEach((role) => spinRecordings.current[role].reset());
-    spinPairedAt.current = {};
-    spinActiveRef.current = true;
-    setSpinStartedAt(Date.now());
-    addLog('Spin test started');
+  const distance = distanceFilter.current.current(now);
+  const ownMeasurement = localRole ? measurements[localRole] ?? null : null;
+  const fresh = isFresh(ownMeasurement?.receivedAt, now);
+  const headingA = headingOf(motionA);
+  const placed = stitchState ? stitchedLayout(stitchState.stitch, headingA, headingOf(motionB)) : null;
+  const headingB = placed?.headingB ?? null;
+  const connected = connection === 'connected';
+  const position: PositionEstimate = placed?.position ?? {
+    source: 'unknown',
+    xCm: null,
+    yCm: null,
+    bearingRad: null,
+    distanceCm: null,
+    reason: connected ? 'swipe across both screens to join' : 'connect the phones first',
   };
-
-  const finishSpin = () => {
-    spinActiveRef.current = false;
-    setSpinStartedAt(null);
-    const fits = { A: spinRecordings.current.A.fit(), B: spinRecordings.current.B.fit() };
-    setSpinFits(fits);
-    addLog(`Spin test finished · A ${fits.A.accepted ? 'accepted' : fits.A.reason} · B ${fits.B.accepted ? 'accepted' : fits.B.reason}`);
-  };
-
-  // Compact rows of [ms since start, heading in degrees, distance in cm] for offline analysis.
-  const shareSpinData = () => {
-    const data = Object.fromEntries(PHONE_ROLES.map((role) => {
-      const samples = spinRecordings.current[role].samples;
-      const startT = samples[0]?.t ?? 0;
-      return [role, {
-        fit: spinFits[role] ?? null,
-        samples: samples.map(({ t, heading, distanceCm }) => [Math.round(t - startT), Math.round(heading * RAD_TO_DEG * 10) / 10, Math.round(distanceCm * 10) / 10]),
-      }];
-    }));
-    void Share.share({ message: JSON.stringify(data) }).catch(reportActionError);
-  };
-
-  useEffect(() => {
-    if (spinStartedAt != null && now - spinStartedAt > SPIN_TIMEOUT_MS) finishSpin();
-  }, [now, spinStartedAt]);
-
-  const measuredPosition = useMemo(
-    () => selectPositionMeasurement(measurementA, measurementB, motionA, motionB, 'A', now),
-    [measurementA, measurementB, motionA, motionB, now],
-  );
-  const commonFrame = hasCommonFrame(motionA?.referenceFrame, motionB?.referenceFrame);
-  const currentMeasurement = measurementA ?? measurementB;
-  const fresh = isFresh(currentMeasurement?.receivedAt, now, STALE_AFTER_MS);
-  const spinPosition = selectSpinPosition(spinFits.A, spinFits.B, fresh ? smoothedDistance : null, commonFrame);
-  const position: PositionEstimate = measuredPosition.source === 'measured'
-    ? measuredPosition
-    : spinPosition.source === 'estimated'
-      ? spinPosition
-      : { ...measuredPosition, reason: `${measuredPosition.reason} · ${spinPosition.reason}` };
-  const relativeRotation = commonFrame
-    ? calculateRelativeRotation(motionA?.attitudeQuaternion, motionB?.attitudeQuaternion)
-    : calculateRelativeRotation(undefined, undefined);
-  const headingA = tablePlaneHeading(motionA?.attitudeQuaternion);
-  const ownHeadingB = tablePlaneHeading(motionB?.attitudeQuaternion);
+  const joined = stitchState?.status === 'joined';
 
   useEffect(() => {
     if (upHeading == null && headingA != null) setUpHeading(headingA);
   }, [headingA, upHeading]);
-  const frameOffset = spinFrameOffset(spinFits.A, spinFits.B);
-  // B is drawn in A's frame: directly when both share magnetic north, otherwise through the two spin bearings.
-  const headingB = ownHeadingB == null
-    ? null
-    : commonFrame
-      ? ownHeadingB
-      : frameOffset == null ? null : wrapAngle(ownHeadingB + frameOffset);
-  const relativeRotationLabel = commonFrame && relativeRotation.yaw != null
-    ? `${formatDegrees(relativeRotation.yaw)} yaw`
-    : headingA != null && headingB != null
-      ? `${formatDegrees(wrapAngle(headingB - headingA))} yaw · SPIN`
-      : 'UNKNOWN';
-  const frameStatus = commonFrame
-    ? 'MAGNETIC NORTH'
-    : motionA && motionB && motionA.referenceFrame !== 'unavailable' && motionB.referenceFrame !== 'unavailable'
-      ? 'LOCAL CORRECTED · NO COMMON FRAME'
-      : 'COMMON FRAME UNAVAILABLE';
-  const directionStatus = !currentMeasurement
-    ? 'WAITING'
-    : !fresh
-      ? 'STALE'
-      : currentMeasurement.directionValid
-        ? 'MEASURED'
-        : currentMeasurement.directionAvailable
-          ? 'INVALID'
-          : 'UNAVAILABLE';
+
+  const bearingToB = position.source === 'unknown' ? null : position.bearingRad;
+  const relativeRotationLabel = headingA != null && headingB != null ? `${formatDegrees(wrapAngle(headingB - headingA))} · GYRO` : 'UNKNOWN';
+  const frames = [motionA?.referenceFrame, motionB?.referenceFrame];
+  const frameStatus = frames.some((frame) => frame === 'xMagneticNorthZVertical')
+    ? 'MAGNETIC · REBUILD FOR GYRO-ONLY YAW'
+    : frames.every((frame) => frame === 'xArbitraryZVertical')
+      ? 'GYRO ONLY'
+      : 'WAITING FOR BOTH PHONES';
+  const geometryLabel = !stitchState
+    ? 'NOT JOINED'
+    : joined
+      ? `JOINED · SWIPE ${stitchState.stitch.from} → ${stitchState.stitch.from === 'A' ? 'B' : 'A'}${stitchState.stitch.snapped ? ' · SQUARE' : ''}`
+      : `MOVED · ${(stitchState.reason ?? 'swipe again').toUpperCase()}`;
+  const uwbCheckLabel = !joined
+    ? '—'
+    : uwbResidualCm == null
+      ? 'SETTLING'
+      : `${uwbResidualCm >= 0 ? '+' : ''}${uwbResidualCm.toFixed(1)} cm · LIMIT ±${MOVED_THRESHOLD_CM} cm`;
+  const joinStatus = !localRole
+    ? 'Waiting for the connection'
+    : joined
+      ? 'Joined'
+      : stitchState
+        ? `Join lost: ${stitchState.reason ?? 'swipe again'}`
+        : localRole === 'A' ? 'Waiting for a swipe' : 'Waiting for a swipe · Phone A pairs them';
   // The map turns as a whole so Phone A's starting direction points up (+Y); the geometry is unchanged.
   const sceneRotation = viewRotation(upHeading);
   const turnForScene = (heading: number | null) => heading == null ? null : wrapAngle(heading + sceneRotation);
-  const connected = connection === 'connected';
   // Multipeer stays connected while Nearby Interaction recovers, so ranging can be restarted then too.
   const canRange = connected || connection === 'recovering';
-  const spinning = spinStartedAt != null;
-  const reportActionError = (error: unknown) => addLog(`Error: ${error instanceof Error ? error.message : String(error)}`);
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <ScrollView contentContainerStyle={styles.container}>
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.eyebrow}>PARALLAX M2 · RELATIVE SPACE</Text>
-            <Text style={styles.title}>Two phones. One frame.</Text>
-            <Text style={styles.subtitle}>Phone A is the connection initiator and fixed origin.</Text>
-          </View>
-          <View style={[styles.statusDot, connected && styles.statusDotConnected]} />
-        </View>
-
-        <View style={styles.visualPanel}>
-          <PositionScene
-            position={rotatePosition(position, sceneRotation)}
-            headingA={turnForScene(headingA)}
-            headingB={turnForScene(headingB)}
-          />
-          <View style={styles.measurementRow}>
+    <View style={styles.root}>
+      <SafeAreaView style={styles.safe}>
+        <ScrollView contentContainerStyle={styles.container}>
+          <View style={styles.header}>
             <View>
-              <Text style={styles.measurementLabel}>SMOOTHED DISTANCE</Text>
-              <Text style={styles.measurement}>{formatDistance(smoothedDistance)}</Text>
+              <Text style={styles.eyebrow}>PARALLAX M2 · RELATIVE SPACE</Text>
+              <Text style={styles.title}>Two phones. One frame.</Text>
+              <Text style={styles.subtitle}>Phone A is the connection initiator and fixed origin.</Text>
             </View>
-            <View style={styles.rightMeasurement}>
-              <Text style={styles.measurementLabel}>RAW</Text>
-              <Text style={styles.rawValue}>{formatDistance(distanceCm)}</Text>
+            <View style={[styles.statusDot, connected && styles.statusDotConnected]} />
+          </View>
+
+          <View style={styles.visualPanel}>
+            <PositionScene
+              position={rotatePosition(position, sceneRotation)}
+              headingA={turnForScene(headingA)}
+              headingB={turnForScene(headingB)}
+              note={stitchState && !joined ? 'MOVED · SWIPE AGAIN' : null}
+              stale={Boolean(stitchState && !joined)}
+            />
+            <View style={styles.measurementRow}>
+              <View>
+                <Text style={styles.measurementLabel}>SMOOTHED DISTANCE</Text>
+                <Text style={styles.measurement}>{formatDistance(distance.fresh ? distance.smoothedCm : null)}</Text>
+              </View>
+              <View style={styles.rightMeasurement}>
+                <Text style={styles.measurementLabel}>{distance.role ? `RAW · ${distance.role}` : 'RAW'}</Text>
+                <Text style={styles.rawValue}>{formatDistance(distance.fresh ? distance.rawCm : null)}</Text>
+              </View>
             </View>
-          </View>
-          <TouchableOpacity disabled={headingA == null} style={styles.viewButton} onPress={() => setUpHeading(headingA)}>
-            <Text style={[styles.viewButtonText, headingA == null && styles.viewButtonTextDisabled]}>Point +Y where Phone A points now</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.statusPanel}>
-          <DiagnosticRow
-            label="GEOMETRY"
-            value={position.source === 'estimated' ? `ESTIMATED · ${position.reason.toUpperCase()}` : position.source.toUpperCase()}
-            tone={position.source === 'measured' ? 'good' : position.source === 'estimated' ? 'normal' : 'warn'}
-          />
-          <DiagnosticRow label="DIRECTION" value={directionStatus} tone={directionStatus === 'MEASURED' ? 'good' : 'warn'} />
-          <DiagnosticRow label="FRAME" value={frameStatus} tone={commonFrame ? 'good' : 'warn'} />
-          <DiagnosticRow label="RELATIVE ROTATION" value={relativeRotationLabel} />
-        </View>
-
-        <View style={styles.connectionRow}>
-          <View>
-            <Text style={styles.label}>CONNECTION</Text>
-            <Text style={styles.connectionValue}>{connection.toUpperCase()}</Text>
-          </View>
-          <Text style={styles.peerCount}>{peers.length} {peers.length === 1 ? 'peer' : 'peers'} nearby</Text>
-        </View>
-
-        {peers.length > 0 && (
-          <View style={styles.peerList}>
-            <Text style={styles.label}>AVAILABLE PHONES</Text>
-            {peers.map((peer) => (
-              <TouchableOpacity key={peer.id} style={styles.peerRow} onPress={() => { void ParallaxModule.connect(peer.id).catch(reportActionError); }}>
-                <View style={styles.peerIcon}><PhoneGlyph accent="red" /></View>
-                <View style={styles.peerInfo}>
-                  <Text style={styles.peerName}>{peer.name}</Text>
-                  <Text style={styles.peerId}>{peer.id}</Text>
-                </View>
-                <Text style={styles.connectAction}>CONNECT</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-
-        <View style={styles.actions}>
-          <TouchableOpacity disabled={!canRange} style={[styles.primary, !canRange && styles.primaryDisabled]} onPress={() => { void ParallaxModule.startRanging().catch(reportActionError); }}>
-            <Text style={styles.primaryText}>{canRange ? 'Start ranging' : 'Waiting for connection'}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.secondary} onPress={() => { void ParallaxModule.disconnect().catch(reportActionError); }}>
-            <Text style={styles.secondaryText}>Disconnect</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.spinPanel}>
-          <Text style={styles.label}>SPIN TEST</Text>
-          <Text style={styles.spinHint}>
-            While ranging, lay one phone flat, hold a fingertip on the middle of its bottom edge, and swing it around that point:
-            two slow full turns, then back. The antenna is near the top, so this makes the distance wave about a phone-length wide.
-            Spin Phone A to place Phone B; spin both to line up their rotations without a compass.
-            Results appear on the phone where you pressed Start.
-          </Text>
-          <TouchableOpacity
-            disabled={!canRange && !spinning}
-            style={[styles.spinButton, spinning && styles.spinButtonActive, !canRange && !spinning && styles.spinButtonDisabled]}
-            onPress={spinning ? finishSpin : startSpin}
-          >
-            <Text style={[styles.spinButtonText, spinning && styles.spinButtonTextActive]}>
-              {spinning ? `Finish spin test · ${Math.max(0, Math.round((now - spinStartedAt) / 1000))} s` : 'Start spin test'}
-            </Text>
-          </TouchableOpacity>
-          {!spinning && (spinFits.A || spinFits.B) && (
-            <TouchableOpacity style={styles.secondary} onPress={shareSpinData}>
-              <Text style={styles.secondaryText}>Share spin data</Text>
+            <TouchableOpacity disabled={headingA == null} style={styles.viewButton} onPress={() => setUpHeading(headingA)}>
+              <Text style={[styles.viewButtonText, headingA == null && styles.viewButtonTextDisabled]}>Point +Y where Phone A points now</Text>
             </TouchableOpacity>
+          </View>
+
+          <View style={styles.statusPanel}>
+            <DiagnosticRow label="GEOMETRY" value={geometryLabel} tone={joined ? 'good' : 'warn'} />
+            <DiagnosticRow label="RELATIVE ROTATION" value={relativeRotationLabel} />
+            <DiagnosticRow
+              label="UWB CHECK"
+              value={uwbCheckLabel}
+              tone={uwbResidualCm == null ? 'normal' : Math.abs(uwbResidualCm) <= MOVED_THRESHOLD_CM ? 'good' : 'warn'}
+            />
+            <DiagnosticRow label="FRAME" value={frameStatus} tone={frameStatus === 'GYRO ONLY' ? 'good' : 'warn'} />
+          </View>
+
+          <View style={styles.connectionRow}>
+            <View>
+              <Text style={styles.label}>CONNECTION</Text>
+              <Text style={styles.connectionValue}>{connection.toUpperCase()}{localRole ? ` · PHONE ${localRole}` : ''}</Text>
+            </View>
+            <Text style={styles.peerCount}>{peers.length} {peers.length === 1 ? 'peer' : 'peers'} nearby</Text>
+          </View>
+
+          {peers.length > 0 && (
+            <View style={styles.peerList}>
+              <Text style={styles.label}>AVAILABLE PHONES</Text>
+              {peers.map((peer) => (
+                <TouchableOpacity key={peer.id} style={styles.peerRow} onPress={() => { void ParallaxModule.connect(peer.id).catch(reportActionError); }}>
+                  <View style={styles.peerIcon}><PhoneGlyph accent="red" /></View>
+                  <View style={styles.peerInfo}>
+                    <Text style={styles.peerName}>{peer.name}</Text>
+                    <Text style={styles.peerId}>{peer.id}</Text>
+                  </View>
+                  <Text style={styles.connectAction}>CONNECT</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
           )}
-        </View>
 
-        <Text style={styles.label}>SENSOR DIAGNOSTICS</Text>
-        <View style={styles.diagnostics}>
-          <RoleDiagnostics role="A" measurement={measurementA} motion={motionA} now={now} />
-          <RoleDiagnostics role="B" measurement={measurementB} motion={motionB} now={now} />
-          <DiagnosticRow label="SESSION" value={(currentMeasurement && fresh ? currentMeasurement.sessionState : sessionState ?? 'idle').toUpperCase()} />
-          <DiagnosticRow label="CAMERA" value={capabilities ? `NOT USED · ${capabilities.cameraAssistanceSupported ? 'AVAILABLE' : 'UNAVAILABLE'}` : 'LOADING'} />
-          <DiagnosticRow
-            label="CAPABILITIES"
-            value={capabilities
-              ? `${capabilities.uwbSupported ? 'UWB' : 'NO UWB'} · ${capabilities.directionMayBeAvailable ? 'DIRECTION' : 'NO DIRECTION'} · ${capabilities.deviceMotionAvailable ? 'MOTION' : 'NO MOTION'} · ${capabilities.magneticNorthAvailable ? 'MAGNETIC' : 'NO MAGNETIC'}`
-              : 'LOADING'}
-          />
-          {PHONE_ROLES.map((role) => (
-            <SpinDiagnostics key={role} role={role} fit={spinFits[role]} recording={spinRecordings.current[role]} active={spinning} />
-          ))}
-        </View>
+          <View style={styles.actions}>
+            <TouchableOpacity disabled={!canRange} style={[styles.primary, !canRange && styles.primaryDisabled]} onPress={() => { void ParallaxModule.startRanging().catch(reportActionError); }}>
+              <Text style={styles.primaryText}>{canRange ? 'Restart ranging' : 'Waiting for connection'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondary} onPress={() => { void ParallaxModule.disconnect().catch(reportActionError); }}>
+              <Text style={styles.secondaryText}>Disconnect</Text>
+            </TouchableOpacity>
+          </View>
 
-        <Text style={styles.label}>EVENT LOG</Text>
-        <View style={styles.diagnostics}>
-          {logs.map((log, index) => <Text style={styles.log} key={`${log}-${index}`}>{log}</Text>)}
-        </View>
-      </ScrollView>
-    </SafeAreaView>
+          <View style={styles.joinPanel}>
+            <Text style={styles.label}>SWIPE JOIN</Text>
+            <Text style={styles.joinPanelHint}>
+              Lay the phones flat with their edges touching and drag one finger from one screen straight onto the other.
+              Turning either phone afterwards is followed by its gyroscope. Sliding one away is noticed by UWB, which asks for a new swipe.
+            </Text>
+            <TouchableOpacity disabled={!canRange} style={[styles.joinButton, !canRange && styles.joinButtonDisabled]} onPress={requestJoin}>
+              <Text style={styles.joinButtonText}>{stitchState ? 'Join again' : 'Swipe to join'}</Text>
+            </TouchableOpacity>
+          </View>
+
+          <Text style={styles.label}>SENSOR DIAGNOSTICS</Text>
+          <View style={styles.diagnostics}>
+            <RoleDiagnostics role="A" measurement={measurementA} motion={motionA} now={now} />
+            <RoleDiagnostics role="B" measurement={measurementB} motion={motionB} now={now} />
+            <DiagnosticRow label="SESSION" value={(ownMeasurement && fresh ? ownMeasurement.sessionState : sessionState ?? 'idle').toUpperCase()} />
+            <DiagnosticRow
+              label="BEARINGS"
+              value={bearingToB == null ? '—' : `A → B ${formatDegrees(bearingToB)} · B → A ${formatDegrees(wrapAngle(bearingToB + Math.PI))} (A'S FRAME)`}
+            />
+            <DiagnosticRow
+              label="JOIN"
+              value={stitchState
+                ? `B AT ${formatDistance(Math.hypot(stitchState.stitch.centreB.xCm, stitchState.stitch.centreB.yCm))} · TURNED ${formatDegrees(stitchState.stitch.relativeYawRad)} · OFFSET ${formatDegrees(stitchState.stitch.yawOffsetRad)}`
+                : '—'}
+            />
+            <DiagnosticRow label="CAMERA" value={capabilities ? `NOT USED · ${capabilities.cameraAssistanceSupported ? 'AVAILABLE' : 'UNAVAILABLE'}` : 'LOADING'} />
+            <DiagnosticRow
+              label="CAPABILITIES"
+              value={capabilities
+                ? `${capabilities.uwbSupported ? 'UWB' : 'NO UWB'} · ${capabilities.directionMayBeAvailable ? 'DIRECTION' : 'NO DIRECTION'} · ${capabilities.deviceMotionAvailable ? 'MOTION' : 'NO MOTION'} · ${capabilities.magneticNorthAvailable ? 'MAGNETIC' : 'NO MAGNETIC'}`
+                : 'LOADING'}
+            />
+          </View>
+
+          <Text style={styles.label}>EVENT LOG</Text>
+          <View style={styles.diagnostics}>
+            {logs.map((log, index) => <Text style={styles.log} key={`${log}-${index}`}>{log}</Text>)}
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+      {joinOpen && <JoinOverlay role={localRole} note={joinNote} status={joinStatus} onSwipe={handleSwipe} onClose={() => setJoinOpen(false)} />}
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: '#0b0d10' },
   safe: { flex: 1, backgroundColor: '#0b0d10' },
   container: { padding: 22, gap: 16 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingTop: 10 },
@@ -661,6 +754,16 @@ const styles = StyleSheet.create({
   rightMeasurement: { alignItems: 'flex-end', paddingBottom: 5 },
   rawValue: { color: '#a9b6c7', fontSize: 16, fontWeight: '700', marginTop: 5 },
   statusPanel: { backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 13, gap: 8 },
+  gamePanel: { backgroundColor: '#211d16', borderRadius: 20, borderWidth: 1, borderColor: '#705733', padding: 16, gap: 12 },
+  gameHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  gameEyebrow: { color: '#f0b36f', fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
+  gameTitle: { color: '#fff1d6', fontSize: 24, fontWeight: '900', marginTop: 4 },
+  scoreBadge: { alignItems: 'center', backgroundColor: '#342918', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8 },
+  scoreText: { color: '#f0b36f', fontSize: 24, fontWeight: '900' },
+  scoreLabel: { color: '#a88d76', fontSize: 8, fontWeight: '900', letterSpacing: 1 },
+  gameHint: { color: '#c4aa83', fontSize: 13, lineHeight: 18 },
+  gameButton: { backgroundColor: '#f0b36f', borderRadius: 13, alignItems: 'center', paddingVertical: 14 },
+  gameButtonText: { color: '#241b12', fontWeight: '900' },
   diagnosticRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
   diagnosticLabel: { color: '#778391', fontSize: 10, fontWeight: '800', letterSpacing: 1.1 },
   diagnosticValue: { color: '#d8e0ea', fontSize: 11, fontWeight: '700', textAlign: 'right', flexShrink: 1 },
@@ -683,17 +786,19 @@ const styles = StyleSheet.create({
   primaryText: { color: '#0b0d10', fontWeight: '800' },
   secondary: { paddingHorizontal: 16, paddingVertical: 16, borderRadius: 14, borderWidth: 1, borderColor: '#35404d', alignItems: 'center' },
   secondaryText: { color: '#e7edf5', fontWeight: '700' },
-  spinPanel: { backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 13, gap: 10 },
-  spinHint: { color: '#8993a1', fontSize: 12, lineHeight: 17 },
-  spinButton: { borderRadius: 14, borderWidth: 1, borderColor: '#80aaff', paddingVertical: 14, alignItems: 'center' },
-  spinButtonActive: { backgroundColor: '#80aaff' },
-  spinButtonDisabled: { borderColor: '#35404d' },
-  spinButtonText: { color: '#80aaff', fontWeight: '800' },
-  spinButtonTextActive: { color: '#0b0d10' },
-  spinPlot: { width: SPIN_PLOT_WIDTH, height: SPIN_PLOT_HEIGHT, alignSelf: 'center', marginTop: 4, borderRadius: 8, backgroundColor: '#0b0e12', overflow: 'hidden' },
-  spinSampleDot: { position: 'absolute', width: 3, height: 3, borderRadius: 1.5, backgroundColor: '#9eabb9' },
-  spinCurveDot: { position: 'absolute', width: 4, height: 4, borderRadius: 2, backgroundColor: '#f0b36f' },
-  spinPlotLabel: { color: '#6f849d', fontSize: 9, fontWeight: '700', textAlign: 'center', marginTop: 4 },
+  joinPanel: { backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 13, gap: 10 },
+  joinPanelHint: { color: '#8993a1', fontSize: 12, lineHeight: 17 },
+  joinButton: { borderRadius: 14, borderWidth: 1, borderColor: '#80aaff', paddingVertical: 14, alignItems: 'center' },
+  joinButtonDisabled: { borderColor: '#35404d' },
+  joinButtonText: { color: '#80aaff', fontWeight: '800' },
+  joinOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#0b0d10', justifyContent: 'center', paddingHorizontal: 32 },
+  joinCopy: { gap: 14 },
+  joinTitle: { color: '#f4f6f8', fontSize: 38, fontWeight: '800', letterSpacing: -1 },
+  joinChevrons: { color: '#80aaff', fontSize: 34, fontWeight: '800' },
+  joinHint: { color: '#8993a1', fontSize: 14, lineHeight: 20 },
+  joinStatus: { color: '#d8e0ea', fontSize: 13, fontWeight: '700' },
+  joinNote: { color: '#f0b36f', fontSize: 13, fontWeight: '700' },
+  joinClose: { position: 'absolute', bottom: 60, alignSelf: 'center', paddingHorizontal: 22, paddingVertical: 12, borderRadius: 14, borderWidth: 1, borderColor: '#35404d' },
   diagnostics: { backgroundColor: '#101318', borderRadius: 14, borderWidth: 1, borderColor: '#202731', padding: 12, gap: 7 },
   log: { color: '#9eabb9', fontSize: 11, fontFamily: 'monospace', lineHeight: 16 },
 });

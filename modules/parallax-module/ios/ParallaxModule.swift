@@ -4,6 +4,7 @@ import Foundation
 import MultipeerConnectivity
 import NearbyInteraction
 import UIKit
+import simd
 
 private struct ParallaxVector3: Codable {
   let x: Double
@@ -31,6 +32,12 @@ private struct ParallaxMotion: Codable {
   let valid: Bool
   let timestamp: Double
   let motionTimestamp: Double?
+  let userAcceleration: ParallaxVector3?
+  let displacementCm: ParallaxVector3?
+  let stationary: Bool?
+  let movingSeconds: Double?
+  /** Start time of this phone's Core Motion run; headings from different runs are not comparable. */
+  var frameId: Double? = nil
 }
 
 private struct ParallaxTelemetry: Codable {
@@ -53,6 +60,10 @@ private struct ParallaxWireEnvelope: Codable {
   let kind: String
   let token: Data?
   let telemetry: ParallaxTelemetry?
+  /** Opaque JSON from the JavaScript layer, such as a shared spin result. */
+  var message: String? = nil
+  /** Motion snapshot sent on its own cadence, independent of UWB updates. */
+  var motion: ParallaxMotion? = nil
 }
 
 public final class ParallaxModule: Module {
@@ -72,10 +83,26 @@ public final class ParallaxModule: Module {
   private var motionReferenceFrame: CMAttitudeReferenceFrame?
   private var motionReferenceFrameName = "unavailable"
   private var magneticNorthAvailable = false
+  // Dead reckoning of the phone's own slide across the table, in the reference frame (metres).
+  private let standardGravity = 9.80665
+  private let stillAccelerationG = 0.025
+  private let stillRotationRate = 0.2
+  private let stillDuration = 0.15
+  private var latestDeviceMotion: CMDeviceMotion?
+  private var lastMotionTimestamp: TimeInterval?
+  private var velocity = SIMD2<Double>(repeating: 0)
+  private var displacement = SIMD2<Double>(repeating: 0)
+  private var stillSince: TimeInterval?
+  private var stationary = true
+  private var movingSeconds = 0.0
+  private var motionFrameId: Double?
+  private var lastMotionPublish: TimeInterval?
+  /** Motion is published to JavaScript and the other phone at about 20 Hz, whatever UWB is doing. */
+  private let motionPublishInterval = 0.05
 
   public func definition() -> ModuleDefinition {
     Name("ParallaxModule")
-    Events("peerDiscovered", "connectionChanged", "distanceUpdated", "motionUpdated", "error", "diagnostic")
+    Events("peerDiscovered", "connectionChanged", "distanceUpdated", "motionUpdated", "peerMessage", "error", "diagnostic")
 
     AsyncFunction("startDiscovery") { [weak self] in self?.startDiscovery() }
     AsyncFunction("stopDiscovery") { [weak self] in self?.stopDiscovery() }
@@ -84,6 +111,14 @@ public final class ParallaxModule: Module {
     AsyncFunction("startRanging") { [weak self] in try self?.startRanging() }
     AsyncFunction("stopRanging") { [weak self] in self?.stopRanging() }
     AsyncFunction("getCapabilities") { [weak self] in self?.capabilities() ?? [:] }
+    AsyncFunction("sendPeerMessage") { [weak self] (message: String) in try self?.sendPeerMessage(message) }
+  }
+
+  private func sendPeerMessage(_ message: String) throws {
+    guard let peer = selectedPeer else {
+      throw NSError(domain: "Parallax", code: 8, userInfo: [NSLocalizedDescriptionKey: "No connected phone to send to"])
+    }
+    try sendEnvelope(ParallaxWireEnvelope(version: 1, kind: "message", token: nil, telemetry: nil, message: message), to: peer)
   }
 
   private func startDiscovery() {
@@ -142,6 +177,7 @@ public final class ParallaxModule: Module {
   private func disconnect() {
     diagnostic("multipeer", "Disconnect requested")
     stopRanging()
+    stopMotionUpdates()
     niSession?.invalidate()
     niSession = nil
     session?.disconnect()
@@ -196,7 +232,6 @@ public final class ParallaxModule: Module {
 
   private func stopRanging() {
     rangingActive = false
-    stopMotionUpdates()
     niSession?.invalidate()
     niSession = nil
   }
@@ -205,9 +240,9 @@ public final class ParallaxModule: Module {
     try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
   }
 
-  private func sendEnvelope(_ envelope: ParallaxWireEnvelope, to peer: MCPeerID) throws {
+  private func sendEnvelope(_ envelope: ParallaxWireEnvelope, to peer: MCPeerID, mode: MCSessionSendDataMode = .reliable) throws {
     guard let session else { throw NSError(domain: "Parallax", code: 7, userInfo: [NSLocalizedDescriptionKey: "Multipeer session is unavailable"]) }
-    try session.send(JSONEncoder().encode(envelope), toPeers: [peer], with: .reliable)
+    try session.send(JSONEncoder().encode(envelope), toPeers: [peer], with: mode)
   }
 
   fileprivate func receiveData(_ data: Data, from peerID: MCPeerID) {
@@ -216,6 +251,10 @@ public final class ParallaxModule: Module {
         receiveDiscoveryToken(tokenData, from: peerID)
       } else if envelope.kind == "telemetry", let telemetry = envelope.telemetry {
         receiveTelemetry(telemetry, from: peerID)
+      } else if envelope.kind == "message", let message = envelope.message {
+        sendEvent("peerMessage", ["peerId": peerID.displayName, "message": message])
+      } else if envelope.kind == "motion", let motion = envelope.motion {
+        sendEvent("motionUpdated", motionDictionary(motion, source: "remote", peerId: peerID.displayName))
       }
       return
     }
@@ -266,6 +305,10 @@ public final class ParallaxModule: Module {
     if state == .connected {
       selectedPeer = peer
       if localRole == "unknown" { localRole = "B" }
+      // Headings are needed for joining before ranging starts, and must not restart while connected.
+      startMotionUpdates()
+    } else if state == .notConnected, session?.connectedPeers.isEmpty ?? true {
+      stopMotionUpdates()
     }
     let value = state == .connected ? "connected" : state == .connecting ? "connecting" : "disconnected"
     let connectedNames = session?.connectedPeers.map(\.displayName).joined(separator: ", ") ?? "none"
@@ -280,7 +323,6 @@ public final class ParallaxModule: Module {
     let direction = object.direction.map { ParallaxVector3(x: Double($0.x), y: Double($0.y), z: Double($0.z)) }
     let directionValid = direction.map { valid($0) && sqrt($0.x * $0.x + $0.y * $0.y + $0.z * $0.z) > 0.000001 } ?? false
     let horizontalAngle = object.horizontalAngle.map(Double.init)
-    let motion = currentMotion(role: localRole)
     let sessionState = rangingActive ? "ranging" : "connected"
     distanceUpdateCount += 1
 
@@ -304,7 +346,6 @@ public final class ParallaxModule: Module {
       "sessionState": sessionState
     ]
     sendEvent("distanceUpdated", payload)
-    if let motion { sendEvent("motionUpdated", motionDictionary(motion, source: "local", peerId: selectedPeer?.displayName)) }
 
     // JSONEncoder throws on NaN or infinity, which would drop the whole telemetry packet.
     let telemetry = ParallaxTelemetry(
@@ -319,7 +360,7 @@ public final class ParallaxModule: Module {
       horizontalAngleAvailable: horizontalAngle != nil,
       timestamp: now,
       sessionState: sessionState,
-      motion: motion?.valid == true ? motion : nil
+      motion: nil
     )
     if let peer = selectedPeer {
       do {
@@ -351,47 +392,110 @@ public final class ParallaxModule: Module {
     diagnostic("telemetry", "Received Phone \(telemetry.role) measurement from \(peerID.displayName)")
   }
 
+  /// Gyro-only yaw. Magnetic frames keep pulling the heading towards what the magnetometer reads,
+  /// and next to another phone's MagSafe magnets that is wrong and changes as the phones move.
+  /// The two phones' arbitrary frames are tied together by the swipe join in JavaScript instead.
   private func prepareMotionReferenceFrame() {
     let available = CMMotionManager.availableAttitudeReferenceFrames()
-    if available.contains(.xMagneticNorthZVertical) {
-      motionReferenceFrame = .xMagneticNorthZVertical
-      motionReferenceFrameName = "xMagneticNorthZVertical"
-      magneticNorthAvailable = true
-    } else if available.contains(.xArbitraryCorrectedZVertical) {
-      motionReferenceFrame = .xArbitraryCorrectedZVertical
-      motionReferenceFrameName = "xArbitraryCorrectedZVertical"
-      magneticNorthAvailable = false
-    } else if available.contains(.xArbitraryZVertical) {
+    magneticNorthAvailable = available.contains(.xMagneticNorthZVertical)
+    if available.contains(.xArbitraryZVertical) {
       motionReferenceFrame = .xArbitraryZVertical
       motionReferenceFrameName = "xArbitraryZVertical"
-      magneticNorthAvailable = false
     } else {
       motionReferenceFrame = nil
       motionReferenceFrameName = "unavailable"
-      magneticNorthAvailable = false
     }
   }
 
   private func startMotionUpdates() {
+    // Restarting would move the arbitrary frame's yaw zero and break any join made in it.
+    guard !motionManager.isDeviceMotionActive else { return }
     prepareMotionReferenceFrame()
     guard motionManager.isDeviceMotionAvailable else {
       diagnostic("motion", "Device motion is unavailable")
       return
     }
-    motionManager.deviceMotionUpdateInterval = 1.0 / 50.0
-    if let frame = motionReferenceFrame { motionManager.startDeviceMotionUpdates(using: frame) }
-    else { motionManager.startDeviceMotionUpdates() }
+    resetDeadReckoning()
+    motionFrameId = Date().timeIntervalSince1970 * 1000
+    lastMotionPublish = nil
+    motionManager.deviceMotionUpdateInterval = 1.0 / 100.0
+    // Delivered on the main queue, where Nearby Interaction callbacks also run, so the state needs no lock.
+    let handler: CMDeviceMotionHandler = { [weak self] data, _ in
+      guard let self, let data else { return }
+      self.integrate(data)
+      self.publishMotionIfDue(data.timestamp)
+    }
+    if let frame = motionReferenceFrame { motionManager.startDeviceMotionUpdates(using: frame, to: .main, withHandler: handler) }
+    else { motionManager.startDeviceMotionUpdates(to: .main, withHandler: handler) }
     diagnostic("motion", "Started device motion with \(motionReferenceFrameName); magneticNorth=\(magneticNorthAvailable)")
   }
 
   private func stopMotionUpdates() {
     if motionManager.isDeviceMotionActive { motionManager.stopDeviceMotionUpdates() }
+    motionFrameId = nil
+  }
+
+  /// Sends the latest motion to JavaScript and, unreliably so a stall cannot queue stale poses, to the other phone.
+  private func publishMotionIfDue(_ timestamp: TimeInterval) {
+    if let last = lastMotionPublish, timestamp - last < motionPublishInterval { return }
+    lastMotionPublish = timestamp
+    guard let motion = currentMotion(role: localRole) else { return }
+    sendEvent("motionUpdated", motionDictionary(motion, source: "local", peerId: selectedPeer?.displayName))
+    guard motion.valid, let peer = selectedPeer, session?.connectedPeers.contains(peer) == true else { return }
+    var envelope = ParallaxWireEnvelope(version: 1, kind: "motion", token: nil, telemetry: nil)
+    envelope.motion = motion
+    _ = try? sendEnvelope(envelope, to: peer, mode: .unreliable)
+  }
+
+  private func resetDeadReckoning() {
+    latestDeviceMotion = nil
+    lastMotionTimestamp = nil
+    velocity = .zero
+    displacement = .zero
+    stillSince = nil
+    stationary = true
+    movingSeconds = 0
+  }
+
+  /// Integrates user acceleration, rotated into the reference frame, twice. Velocity is zeroed
+  /// whenever the phone has been still briefly, so drift only builds up while it is moving.
+  private func integrate(_ data: CMDeviceMotion) {
+    latestDeviceMotion = data
+    defer { lastMotionTimestamp = data.timestamp }
+    guard let last = lastMotionTimestamp else { return }
+    let dt = data.timestamp - last
+    guard dt > 0, dt < 0.1 else { return }
+
+    let user = data.userAcceleration
+    let rate = data.rotationRate
+    let accelerationG = sqrt(user.x * user.x + user.y * user.y + user.z * user.z)
+    let rotationRate = sqrt(rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
+    guard accelerationG.isFinite, rotationRate.isFinite else { return }
+    if accelerationG < stillAccelerationG && rotationRate < stillRotationRate {
+      stillSince = stillSince ?? data.timestamp
+    } else {
+      stillSince = nil
+    }
+    stationary = stillSince.map { data.timestamp - $0 >= stillDuration } ?? false
+    if stationary {
+      velocity = .zero
+      return
+    }
+
+    // Same convention as the JavaScript spatial layer: v_ref = q · v · q*.
+    let q = data.attitude.quaternion
+    let world = simd_quatd(ix: q.x, iy: q.y, iz: q.z, r: q.w).act(SIMD3(user.x, user.y, user.z) * standardGravity)
+    velocity += SIMD2(world.x, world.y) * dt
+    displacement += velocity * dt
+    movingSeconds += dt
   }
 
   private func currentMotion(role: String) -> ParallaxMotion? {
-    guard let data = motionManager.deviceMotion else { return nil }
+    guard let data = latestDeviceMotion else { return nil }
     let attitude = data.attitude.quaternion
-    let finite = [attitude.x, attitude.y, attitude.z, attitude.w, data.gravity.x, data.gravity.y, data.gravity.z].allSatisfy(\.isFinite)
+    let user = data.userAcceleration
+    let finite = [attitude.x, attitude.y, attitude.z, attitude.w, data.gravity.x, data.gravity.y, data.gravity.z, user.x, user.y, user.z, displacement.x, displacement.y]
+      .allSatisfy(\.isFinite)
     return ParallaxMotion(
       role: role,
       attitudeQuaternion: ParallaxQuaternion(x: attitude.x, y: attitude.y, z: attitude.z, w: attitude.w),
@@ -401,10 +505,15 @@ public final class ParallaxModule: Module {
       gravity: ParallaxVector3(x: data.gravity.x, y: data.gravity.y, z: data.gravity.z),
       angularVelocity: ParallaxVector3(x: data.rotationRate.x, y: data.rotationRate.y, z: data.rotationRate.z),
       referenceFrame: motionReferenceFrameName,
-      commonFrameAvailable: magneticNorthAvailable,
+      commonFrameAvailable: false,
       valid: finite,
       timestamp: Date().timeIntervalSince1970 * 1000,
-      motionTimestamp: data.timestamp
+      motionTimestamp: data.timestamp,
+      userAcceleration: ParallaxVector3(x: user.x, y: user.y, z: user.z),
+      displacementCm: ParallaxVector3(x: displacement.x * 100, y: displacement.y * 100, z: 0),
+      stationary: stationary,
+      movingSeconds: movingSeconds,
+      frameId: motionFrameId
     )
   }
 
@@ -453,7 +562,12 @@ public final class ParallaxModule: Module {
       "commonFrameAvailable": motion.commonFrameAvailable,
       "valid": motion.valid,
       "timestamp": motion.timestamp,
-      "motionTimestamp": motion.motionTimestamp as Any
+      "motionTimestamp": motion.motionTimestamp as Any,
+      "userAcceleration": motion.userAcceleration.map(dictionary) as Any,
+      "displacementCm": motion.displacementCm.map(dictionary) as Any,
+      "stationary": motion.stationary as Any,
+      "movingSeconds": motion.movingSeconds as Any,
+      "frameId": motion.frameId as Any
     ]
   }
 
@@ -478,7 +592,6 @@ public final class ParallaxModule: Module {
     if session === niSession {
       niSession = nil
       rangingActive = false
-      stopMotionUpdates()
     }
     let peerConnected = selectedPeer.map { self.session?.connectedPeers.contains($0) ?? false } ?? false
     sendConnection(state: peerConnected ? "connected" : "disconnected", peer: selectedPeer, sessionState: "invalidated")

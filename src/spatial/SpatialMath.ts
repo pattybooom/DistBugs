@@ -1,6 +1,6 @@
 import { DistanceEvent, MotionEvent, Quaternion, ReferenceFrame, Vector3 } from '../native/ParallaxModule';
 
-export type GeometrySource = 'measured' | 'estimated' | 'manual' | 'unknown';
+export type GeometrySource = 'measured' | 'estimated' | 'stitched' | 'manual' | 'unknown';
 
 export type PositionEstimate = {
   source: GeometrySource;

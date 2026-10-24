@@ -1,5 +1,12 @@
 import { wrapAngle } from '../src/spatial/SpatialMath';
-import { selectSpinPosition, SpinFit, spinFrameOffset, SpinRecording } from '../src/spatial/SpinBearing';
+import {
+  parseSharedSpinFits,
+  selectSpinPosition,
+  serializeSpinFits,
+  SpinFit,
+  spinFrameOffset,
+  SpinRecording,
+} from '../src/spatial/SpinBearing';
 
 const DEG = Math.PI / 180;
 
@@ -144,4 +151,17 @@ test('uses a spin on Phone B only when both phones share magnetic north', () => 
 test('keeps the position unknown without a fresh distance or an accepted spin', () => {
   expect(selectSpinPosition(acceptedFit(90), undefined, null, false).reason).toBe('distance unavailable or stale');
   expect(selectSpinPosition({ ...acceptedFit(90), accepted: false }, undefined, 100, false).reason).toBe('no accepted spin test');
+});
+
+test('shares a spin result with the other phone', () => {
+  const rejected = simulateSpin({ bearingDeg: 30, toDeg: 180 }).fit();
+  const shared = parseSharedSpinFits(serializeSpinFits({ A: acceptedFit(30), B: rejected }));
+  expect(shared?.A).toEqual(acceptedFit(30));
+  expect(shared?.B).toMatchObject({ accepted: false, reason: 'turn through a full circle' });
+});
+
+test('ignores messages that are not spin results', () => {
+  expect(parseSharedSpinFits('not json')).toBeNull();
+  expect(parseSharedSpinFits(JSON.stringify({ type: 'other', fits: {} }))).toBeNull();
+  expect(parseSharedSpinFits(JSON.stringify({ type: 'spinFits', fits: { A: { bearingRad: 1 } } }))).toEqual({});
 });
