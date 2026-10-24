@@ -250,6 +250,27 @@ export function stitchedLayout(stitch: Stitch, headingA: number | null, ownHeadi
   };
 }
 
+/** A screen's place on the table: its centre in mm and its top edge's heading, both in Phone A's motion frame. */
+export type ScreenPose = { centreMm: PointMm; headingRad: number };
+
+/** Both screens on the table, from a join and both phones' current headings in Phone A's frame. */
+export function screenPoses(stitch: Stitch, headingA: number, headingB: number): Record<PhoneRole, ScreenPose> {
+  return {
+    A: { centreMm: { x: 0, y: 0 }, headingRad: headingA },
+    B: { centreMm: { x: stitch.centreB.xCm * 10, y: stitch.centreB.yCm * 10 }, headingRad: headingB },
+  };
+}
+
+/**
+ * Where a point on the table falls on a phone's screen, in points from its top-left corner.
+ * Points beyond the screen come out off its edges, so anything drawn along a path on the table
+ * simply leaves one screen and appears on the other.
+ */
+export function tableToScreen(point: PointMm, pose: ScreenPose, screen: ScreenSize, pointsPerMm = POINTS_PER_MM): { xPt: number; yPt: number } {
+  const local = rotate({ x: point.x - pose.centreMm.x, y: point.y - pose.centreMm.y }, Math.PI / 2 - pose.headingRad);
+  return { xPt: screen.widthPt / 2 + local.x * pointsPerMm, yPt: screen.heightPt / 2 - local.y * pointsPerMm };
+}
+
 /** Antenna-to-antenna distance the join predicts, for comparison with UWB; headings are in A's frame. */
 export function predictedAntennaDistanceCm(stitch: Stitch, headingA: number, headingB: number): number {
   const antennaA = { x: Math.cos(headingA) * ANTENNA_FROM_CENTRE_CM, y: Math.sin(headingA) * ANTENNA_FROM_CENTRE_CM };

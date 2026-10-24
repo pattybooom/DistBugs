@@ -9,10 +9,13 @@ import {
   PointMm,
   POINTS_PER_MM,
   predictedAntennaDistanceCm,
+  ScreenPose,
+  screenPoses,
   ScreenSize,
   serializeStitchMessage,
   stitchedLayout,
   SwipeReport,
+  tableToScreen,
   TouchSample,
 } from '../src/spatial/Stitch';
 import { wrapAngle } from '../src/spatial/SpatialMath';
@@ -210,6 +213,27 @@ describe('swipe join', () => {
       expect(positionErrorMm).toBeLessThan(10);
       expect(headingErrorRad).toBeLessThan(5 * DEG);
     }
+  });
+
+  test('maps a path between the centres onto both screens as the real layout does', () => {
+    const { phoneA, phoneB, start, end } = layout({ turnRad: 30 * DEG, entryYMm: 15 });
+    const reports = reportsFor([phoneA, phoneB], swipe(start, end, [phoneA, phoneB]));
+    const match = matchSwipes(reports)!;
+    const { stitch } = computeStitch(match.exit, match.entry, 0);
+    const placed = stitchedLayout(stitch!, phoneA.heading, wrapAngle(phoneB.heading - 1.1));
+    const poses = screenPoses(stitch!, placed.headingA!, placed.headingB!);
+    [0, 0.25, 0.5, 0.75, 1].forEach((fraction) => {
+      const point = { x: phoneB.x * fraction, y: phoneB.y * fraction };
+      [[poses.A, phoneA], [poses.B, phoneB]].forEach(([pose, truth]) => {
+        const drawn = tableToScreen(point, pose as ScreenPose, (truth as typeof phoneA).screen);
+        const expected = worldToTouch(point, truth as typeof phoneA);
+        expect(Math.hypot(drawn.xPt - expected.xPt, drawn.yPt - expected.yPt)).toBeLessThan(1);
+      });
+    });
+    // Each centre sits at its own screen's centre and off the other screen.
+    expect(tableToScreen(poses.B.centreMm, poses.B, IPHONE_14_PLUS).xPt).toBeCloseTo(IPHONE_14_PLUS.widthPt / 2);
+    expect(tableToScreen(poses.B.centreMm, poses.A, IPHONE_17).xPt).toBeGreaterThan(IPHONE_17.widthPt);
+    expect(tableToScreen(poses.A.centreMm, poses.B, IPHONE_14_PLUS).xPt).toBeLessThan(0);
   });
 
   test('follows later gyro turns of Phone B about its centre', () => {

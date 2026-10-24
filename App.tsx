@@ -1,5 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
-import { GestureResponderEvent, SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
+import {
+  Animated,
+  Dimensions,
+  Easing,
+  GestureResponderEvent,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  useWindowDimensions,
+  View,
+} from 'react-native';
 import ParallaxModule, {
   ConnectionState,
   DistanceEvent,
@@ -29,11 +41,14 @@ import {
   parseStitchMessage,
   PhoneRole,
   predictedAntennaDistanceCm,
+  screenPoses,
   serializeStitchMessage,
+  Stitch,
   StitchMessage,
   StitchState,
   stitchedLayout,
   SwipeReport,
+  tableToScreen,
   TouchSample,
 } from './src/spatial/Stitch';
 import { DistanceFilter, FilteredDistance } from './src/state/DistanceFilter';
@@ -43,6 +58,12 @@ const CONNECTION_STATES: ConnectionState[] = ['disconnected', 'connecting', 'con
 const SWIPE_REPORT_LIFETIME_MS = 3000;
 /** Gives the other phone a moment to finish connecting before both send their Nearby Interaction tokens. */
 const AUTO_RANGING_DELAY_MS = 500;
+/** Join animation: the spark's crossing, then the landing ring and fade. */
+const LINK_TRAVEL_MS = 1100;
+const LINK_SETTLE_MS = 700;
+const LINK_HEAD_SIZE = 26;
+const LINK_RING_SIZE = 64;
+const LINK_COLORS: Record<PhoneRole, string> = { A: '#80aaff', B: '#f0717d' };
 const SCENE_WIDTH = 340;
 const SCENE_HEIGHT = 410;
 const ORIGIN_X = SCENE_WIDTH / 2;
@@ -261,6 +282,75 @@ function RoleDiagnostics({
   );
 }
 
+type ScreenPoint = { xPt: number; yPt: number };
+type LinkPath = { id: string; from: PhoneRole; start: ScreenPoint; end: ScreenPoint };
+
+/**
+ * Plays when the phones join: a ring pulses on the phone the swipe started on, a spark runs to
+ * the other phone's centre with a beam behind it, and a ring pulses where it lands. Both phones
+ * draw the same path on the table in their own screen points, so the part beyond each screen
+ * falls off its edge and the spark crosses the gap from one phone onto the other.
+ */
+function LinkAnimation({ path, onDone }: { path: LinkPath; onDone: () => void }) {
+  const travel = useRef(new Animated.Value(0)).current;
+  const settle = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    // The same easing on both phones keeps the spark at the same place on the table on each.
+    const animation = Animated.sequence([
+      Animated.timing(travel, { toValue: 1, duration: LINK_TRAVEL_MS, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }),
+      Animated.timing(settle, { toValue: 1, duration: LINK_SETTLE_MS, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+    ]);
+    animation.start(({ finished }) => { if (finished) onDone(); });
+    return () => animation.stop();
+  }, [travel, settle]);
+
+  const { start, end } = path;
+  const color = LINK_COLORS[path.from];
+  const lengthPt = Math.hypot(end.xPt - start.xPt, end.yPt - start.yPt);
+  const angleRad = Math.atan2(end.yPt - start.yPt, end.xPt - start.xPt);
+  const fadeOut = settle.interpolate({ inputRange: [0, 1], outputRange: [1, 0] });
+  const fadeIn = travel.interpolate({ inputRange: [0, 0.08], outputRange: [0, 1], extrapolate: 'clamp' });
+  const ring = (at: ScreenPoint) => ({ left: at.xPt - LINK_RING_SIZE / 2, top: at.yPt - LINK_RING_SIZE / 2, borderColor: color });
+
+  return (
+    <View pointerEvents="none" style={styles.linkLayer}>
+      <Animated.View
+        style={[styles.linkRing, ring(start), {
+          opacity: travel.interpolate({ inputRange: [0, 0.5], outputRange: [0.9, 0], extrapolate: 'clamp' }),
+          transform: [{ scale: travel.interpolate({ inputRange: [0, 0.5], outputRange: [0.3, 2.6], extrapolate: 'clamp' }) }],
+        }]}
+      />
+      <Animated.View
+        style={[styles.linkBeam, {
+          left: start.xPt,
+          top: start.yPt - 2,
+          width: lengthPt,
+          backgroundColor: color,
+          shadowColor: color,
+          opacity: Animated.multiply(fadeIn, fadeOut),
+          transform: [{ rotate: `${angleRad}rad` }, { scaleX: travel.interpolate({ inputRange: [0, 1], outputRange: [0.001, 1] }) }],
+        }]}
+      />
+      <Animated.View
+        style={[styles.linkHead, {
+          shadowColor: color,
+          opacity: Animated.multiply(fadeIn, fadeOut),
+          transform: [
+            { translateX: travel.interpolate({ inputRange: [0, 1], outputRange: [start.xPt - LINK_HEAD_SIZE / 2, end.xPt - LINK_HEAD_SIZE / 2] }) },
+            { translateY: travel.interpolate({ inputRange: [0, 1], outputRange: [start.yPt - LINK_HEAD_SIZE / 2, end.yPt - LINK_HEAD_SIZE / 2] }) },
+          ],
+        }]}
+      />
+      <Animated.View
+        style={[styles.linkRing, ring(end), {
+          opacity: settle.interpolate({ inputRange: [0, 0.1, 1], outputRange: [0, 1, 0] }),
+          transform: [{ scale: settle.interpolate({ inputRange: [0, 1], outputRange: [0.3, 3.2] }) }],
+        }]}
+      />
+    </View>
+  );
+}
+
 /**
  * Full-screen catcher for the join swipe. Both phones show it at once; the finger's trail on
  * each screen is read for where it left or arrived, and Phone A pairs the two halves.
@@ -339,6 +429,7 @@ export default function App() {
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinNote, setJoinNote] = useState<string | null>(null);
   const [uwbResidualCm, setUwbResidualCm] = useState<number | null>(null);
+  const [linkPath, setLinkPath] = useState<LinkPath | null>(null);
   /** Phone A's heading when its first motion reading arrived; the map draws it pointing up. */
   const [upHeading, setUpHeading] = useState<number | null>(null);
   // Native callbacks are subscribed once, so they read the latest values through refs.
@@ -357,10 +448,28 @@ export default function App() {
     void ParallaxModule.sendPeerMessage(serializeStitchMessage(message)).catch(reportActionError);
   };
 
+  /** Lays the join animation's path, centre to centre, out in this phone's screen points. */
+  const playLink = (stitch: Stitch) => {
+    const role = localRoleRef.current;
+    const placed = stitchedLayout(stitch, headingOf(motionsRef.current.A), headingOf(motionsRef.current.B));
+    if (!role || placed.headingA == null || placed.headingB == null) return;
+    const poses = screenPoses(stitch, placed.headingA, placed.headingB);
+    const { width, height } = Dimensions.get('window');
+    const screen = { widthPt: width, heightPt: height };
+    const to = stitch.from === 'A' ? 'B' : 'A';
+    setLinkPath({
+      id: stitch.id,
+      from: stitch.from,
+      start: tableToScreen(poses[stitch.from].centreMm, poses[role], screen),
+      end: tableToScreen(poses[to].centreMm, poses[role], screen),
+    });
+  };
+
   const applyStitchState = (state: StitchState | null) => {
     if (state?.stitch.id !== stitchRef.current?.stitch.id) {
       movedCheck.current.reset();
       setUwbResidualCm(null);
+      if (state?.status === 'joined') playLink(state.stitch);
     }
     stitchRef.current = state;
     setStitchState(state);
@@ -700,6 +809,7 @@ export default function App() {
         </ScrollView>
       </SafeAreaView>
       {joinOpen && <JoinOverlay role={localRole} note={joinNote} status={joinStatus} onSwipe={handleSwipe} onClose={() => setJoinOpen(false)} />}
+      {linkPath && <LinkAnimation key={linkPath.id} path={linkPath} onDone={() => setLinkPath(null)} />}
     </View>
   );
 }
@@ -799,6 +909,10 @@ const styles = StyleSheet.create({
   joinStatus: { color: '#d8e0ea', fontSize: 13, fontWeight: '700' },
   joinNote: { color: '#f0b36f', fontSize: 13, fontWeight: '700' },
   joinClose: { position: 'absolute', bottom: 60, alignSelf: 'center', paddingHorizontal: 22, paddingVertical: 12, borderRadius: 14, borderWidth: 1, borderColor: '#35404d' },
+  linkLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  linkRing: { position: 'absolute', width: LINK_RING_SIZE, height: LINK_RING_SIZE, borderRadius: LINK_RING_SIZE / 2, borderWidth: 2 },
+  linkBeam: { position: 'absolute', height: 4, borderRadius: 2, transformOrigin: 'left center', shadowOpacity: 0.9, shadowRadius: 10, shadowOffset: { width: 0, height: 0 } },
+  linkHead: { position: 'absolute', left: 0, top: 0, width: LINK_HEAD_SIZE, height: LINK_HEAD_SIZE, borderRadius: LINK_HEAD_SIZE / 2, backgroundColor: '#f4f8ff', shadowOpacity: 1, shadowRadius: 16, shadowOffset: { width: 0, height: 0 } },
   diagnostics: { backgroundColor: '#101318', borderRadius: 14, borderWidth: 1, borderColor: '#202731', padding: 12, gap: 7 },
   log: { color: '#9eabb9', fontSize: 11, fontFamily: 'monospace', lineHeight: 16 },
 });
