@@ -13,7 +13,10 @@
     "ios": {
       "supportsTablet": true,
       "deploymentTarget": "16.0",
-      "bundleIdentifier": "com.patricksammm.parallax"
+      "bundleIdentifier": "com.patricksammm.parallax",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -27,6 +30,11 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "02194c3c-af1a-4c83-9afa-c7e165917765"
+      }
     }
   }
 }

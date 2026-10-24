@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
-    "expo": "~58.0.19",
-    "expo-status-bar": "~58.0.4",
+    "expo": "~54.0.38",
     "expo-dev-client": "~3.3.12",
     "expo-modules-core": "~1.12.26",
+    "expo-status-bar": "~58.0.4",
     "parallax-module": "file:./modules/parallax-module",
     "react": "19.3.0",
     "react-native": "0.88.0"
