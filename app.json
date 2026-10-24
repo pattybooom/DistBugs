@@ -7,7 +7,13 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "plugins": [
-      "expo-dev-client",
+      [
+        "expo-dev-client",
+        {
+          "launchMode": "most-recent",
+          "defaultLaunchURL": "http://10.21.240.35:8081"
+        }
+      ],
       "./plugins/withParallaxIos"
     ],
     "ios": {

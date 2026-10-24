@@ -6,6 +6,8 @@ module.exports = function withParallaxIos(config) {
       'Parallax uses the local network to discover nearby phones.';
     config.modResults.NSNearbyInteractionUsageDescription =
       'Parallax uses Nearby Interaction to measure the distance between paired phones.';
+    config.modResults.NSMotionUsageDescription =
+      'Parallax uses motion sensors to align the phones and show their relative orientations.';
     config.modResults.NSBonjourServices = ['_parallax-uwb._tcp'];
     return config;
   });
