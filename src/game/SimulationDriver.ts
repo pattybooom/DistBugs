@@ -1,4 +1,4 @@
-import { setPaused, STEP_S, stepSimulation } from './Simulation';
+import { ExitCheck, setPaused, STEP_S, stepSimulation } from './Simulation';
 import { SimulationEvent, SimulationState } from './types';
 
 /** A long frame (a hitch, or the first frame after a pause) advances at most this much: no catch-up. */
@@ -6,7 +6,7 @@ export const MAX_FRAME_S = 0.25;
 /** Saves at least this often while running, besides saving on births, deaths and the end. */
 export const AUTOSAVE_INTERVAL_S = 15;
 
-const MEANINGFUL_EVENTS = new Set<SimulationEvent['type']>(['born', 'died', 'ecosystem-ended']);
+const MEANINGFUL_EVENTS = new Set<SimulationEvent['type']>(['born', 'died', 'ecosystem-ended', 'departed']);
 
 /**
  * Turns real frame time into fixed simulation steps and decides when to save. It owns the
@@ -19,6 +19,7 @@ export class SimulationDriver {
   private accumulatorS = 0;
   private sinceSaveS = 0;
   private appActive = true;
+  private canExit: ExitCheck | null = null;
 
   constructor(state: SimulationState, save: (state: SimulationState) => void) {
     this.state = state;
@@ -45,6 +46,11 @@ export class SimulationDriver {
     this.saveNow();
   }
 
+  /** Opens habitat walls that lead somewhere else; null closes them all again. */
+  setExitCheck(canExit: ExitCheck | null): void {
+    this.canExit = canExit;
+  }
+
   saveNow(): void {
     this.sinceSaveS = 0;
     this.save(this.state);
@@ -57,7 +63,7 @@ export class SimulationDriver {
     const events: SimulationEvent[] = [];
     // The tolerance stops float error in the remainder from dropping a step.
     while (this.accumulatorS >= STEP_S - 1e-9 && this.running) {
-      events.push(...stepSimulation(this.state));
+      events.push(...stepSimulation(this.state, { canExit: this.canExit }));
       this.accumulatorS -= STEP_S;
       this.sinceSaveS += STEP_S;
     }

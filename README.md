@@ -5,7 +5,7 @@ An autonomous bug ecosystem for one phone. The player designs two starter bugs i
 ## Ecosystem
 
 - **Workshop.** Each starter has a look (body, eyes, horns, feature, colour palette) and a behaviour (speed, aggression, lifespan, hunger rate, food needed to breed). *Randomise* rolls a pair from the ecosystem's seed.
-- **Habitat.** A 360 × 520 unit rectangle, scaled to fit the screen. Food spawns about every 1.8 s (at most 14 at once) and expires after 20 s, blinking for its last 4 s.
+- **Habitat.** Fills the whole screen, edge to edge, with the controls floating over it on see-through panels. It is 360 units wide and as tall as the screen's shape makes it (783 on an iPhone 17); older saves are stretched to fit. Food spawns at the same density as in a 360 × 520 habitat (there, about every 1.8 s and at most 14 at once) and expires after 20 s, blinking for its last 4 s.
 - **Behaviour.** A bug heads for the nearest food within 120 units, otherwise it wanders. Satiety (0–100) drains at the hunger rate, faster for fast and aggressive bugs, and each meal adds 30. A hungry bug that is clearly more aggressive (by 0.15 or more) chases a calmer one away.
 - **Life cycle.** A bug dies of old age at the end of its lifespan, or of starvation when satiety reaches 0. Once it has lived 15% of its lifespan, eaten its breeding threshold and has satiety of at least 35, it lays one offspring nearby (population cap 40). Newborns are drawn small and grow as they mature; old bugs fade; hungry bugs show a red bar.
 - **Inheritance.** Each behaviour trait drifts by at most one small mutation step per generation, within its range. One birth in 25 also changes the look slightly: a hue nudge (never past ±40°) or a step to the neighbouring feature. Body, eyes and horns are always inherited unchanged.
@@ -17,6 +17,16 @@ Pacing is tuned so a bug's life takes 1–3 minutes: with the default starters t
 The simulation (`src/game/`) is plain TypeScript with no React Native imports. It is seeded (`Random.ts`, Mulberry32, whose state is saved with the ecosystem) and advances in fixed 50 ms steps (`stepSimulation`), so the same seed always plays out the same way and the tests can drive it directly. `SimulationDriver` turns frame time into steps (a long frame advances at most 0.25 s) and decides when to save. Sprites (`sprites.ts`) are assembled from hand-drawn pixel components and recoloured from the palette.
 
 The ecosystem is saved with AsyncStorage on every birth and death, at least every 15 s while running, when pausing, and when the app leaves the foreground. Leaving the foreground also pauses it, so no simulated time passes while the app is closed; on the next launch it is restored paused and *Resume* carries on.
+
+## Linking two phones
+
+Two phones can join their habitats so bugs walk from one to the other. Open **Link** on both phones and connect from one; the phone that connects is Phone A. Lay the phones flat with their edges touching and swipe one finger from one screen onto the other, the same swipe join the Spatial Lab uses (`Stitch.ts`). Once joined, the open stretches of each habitat's walls glow blue along the screen's edge.
+
+- **Where walls open** (`src/game/crossing.ts`). Each phone sends the other where its habitat is drawn on screen (`layout` message), which is the whole screen. A wall is open where walking straight out of it reaches the other habitat within 15 mm: the two bezels (7 mm) plus slack for cases and an imperfect join. So a bug crosses only once it reaches the physical edge of the screen, and only where that edge meets the other phone. The bug arrives at that point, heading the same way across the table; a bug heading almost along the wall is turned to walk straight in.
+- **No motion data.** Both phones report the same heading in the join, so it comes out in Phone A's screen frame. Turning or sliding a phone afterwards is not tracked: swipe again (**Join again**).
+- **Handing over** (`useBugBridge.ts`). A bug that walks through an open wall leaves the simulation (`departed` event) and is sent across. It stays this phone's until the other phone confirms it took it. If the other phone turns it away (not running, paused or full), doesn't answer within 4 s, or the connection drops, the bug walks back in where it left. The arriving bug gets a new id there and keeps its name, traits and lineage.
+- **Never empties a habitat.** Bugs only leave while more than two stay behind, so crossing never ends an ecosystem.
+- Linking stops while the Spatial Lab is open, since both use the same connection, and restarts on return. A bug in flight when the app is closed can be lost.
 
 ## Spatial Lab
 

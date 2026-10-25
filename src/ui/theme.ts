@@ -17,6 +17,7 @@ export const COLORS = {
   food: '#b6e35a',
   foodCore: '#f4f7c8',
   select: '#fff3c4',
+  travel: '#8fc7ef',
 };
 
 export const PIXEL_FONT = Platform.select({ ios: 'Menlo', default: 'monospace' });

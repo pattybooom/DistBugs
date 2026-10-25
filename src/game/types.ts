@@ -41,6 +41,8 @@ export type Food = { id: string; x: number; y: number; spawnedAtS: number; expir
 
 export type DeathCause = 'old-age' | 'starvation';
 
+export type HabitatEdge = 'left' | 'right' | 'top' | 'bottom';
+
 export type Bug = {
   id: string;
   name: string;
@@ -105,4 +107,6 @@ export type SimulationEvent =
   | { type: 'ate'; bugId: string; foodId: string }
   | { type: 'born'; bugId: string; name: string; parentId: string; generation: number; visualMutation: boolean }
   | { type: 'died'; bugId: string; name: string; cause: DeathCause; ageS: number }
-  | { type: 'ecosystem-ended'; survivors: number };
+  | { type: 'ecosystem-ended'; survivors: number }
+  /** The bug walked out through an open edge and is no longer in this ecosystem. */
+  | { type: 'departed'; bug: Bug; edge: HabitatEdge; x: number; y: number };

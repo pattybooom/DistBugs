@@ -32,7 +32,7 @@ function isTraitSet(value: unknown): value is TraitSet {
     && BEHAVIOUR_KEYS.every((key) => isNumber(behaviour[key]));
 }
 
-const isBug = (value: unknown): value is Bug =>
+export const isBug = (value: unknown): value is Bug =>
   isObject(value)
   && typeof value.id === 'string'
   && typeof value.name === 'string'

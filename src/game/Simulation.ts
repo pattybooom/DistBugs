@@ -1,19 +1,22 @@
 import { Random } from './Random';
 import { BEHAVIOUR_SPECS, defaultTraits, inheritTraits, randomTraits } from './traits';
-import { Bug, DeathCause, EcosystemStats, Food, Habitat, SimulationEvent, SimulationState, TraitSet } from './types';
+import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, SimulationEvent, SimulationState, TraitSet } from './types';
 
 /** Fixed timestep: the simulation always advances in steps of this length, whatever the frame rate. */
 export const STEP_S = 0.05;
 export const DEFAULT_HABITAT: Habitat = { width: 360, height: 520 };
+/** Habitats are this many units wide; their height follows the screen's shape. */
+export const HABITAT_WIDTH = 360;
 
 export const MAX_SATIETY = 100;
 export const STARTER_SATIETY = 80;
 export const OFFSPRING_SATIETY = 60;
 export const FOOD_SATIETY = 30;
 
-/** Mean seconds between food spawns; each interval is jittered ±50%. */
+/** Mean seconds between food spawns in a default-sized habitat; each interval is jittered ±50%. */
 export const FOOD_SPAWN_INTERVAL_S = 1.8;
 export const FOOD_LIFETIME_S = 20;
+/** Most food at once in a default-sized habitat. Larger habitats get more, at the same density. */
 export const MAX_FOOD = 14;
 export const STARTER_FOOD = 3;
 
@@ -37,6 +40,12 @@ export const MATURITY_FRACTION = 0.15;
 export const BREEDING_MIN_SATIETY = 35;
 export const BREEDING_SATIETY_COST = 20;
 const OFFSPRING_DISTANCE = 10;
+/** Bugs only leave through an open edge while more than this many stay behind, so leaving never ends an ecosystem. */
+export const MIN_HOME_POPULATION = 2;
+
+/** Says whether the wall at `point` opens onto somewhere else (another phone's habitat). */
+export type ExitCheck = (point: { x: number; y: number }, edge: HabitatEdge) => boolean;
+export type StepOptions = { dt?: number; canExit?: ExitCheck | null };
 
 const NAME_SYLLABLES = ['bo', 'zi', 'ka', 'mu', 'pi', 'ro', 'ta', 'ne', 'lu', 'vo', 'sa', 'do', 'fe', 'gri', 'mo', 'ti', 'bu', 'xi'];
 
@@ -60,6 +69,27 @@ export function bugName(rng: Random): string {
 
 const wrapAngle = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
 
+/** A habitat with the screen's proportions, so it can fill the screen edge to edge. */
+export const habitatForScreen = (widthPt: number, heightPt: number): Habitat =>
+  ({ width: HABITAT_WIDTH, height: Math.round((HABITAT_WIDTH * heightPt) / widthPt) });
+
+/** Food scales with area, so a taller habitat is no hungrier than the default one. */
+const foodScale = ({ width, height }: Habitat) => (width * height) / (DEFAULT_HABITAT.width * DEFAULT_HABITAT.height);
+export const maxFood = (habitat: Habitat) => Math.round(MAX_FOOD * foodScale(habitat));
+export const foodSpawnIntervalS = (habitat: Habitat) => FOOD_SPAWN_INTERVAL_S / foodScale(habitat);
+
+/** Stretches an ecosystem onto a habitat of another shape (a save from another screen), keeping everything in place. */
+export function resizeHabitat(state: SimulationState, habitat: Habitat): void {
+  const sx = habitat.width / state.habitat.width;
+  const sy = habitat.height / state.habitat.height;
+  if (sx === 1 && sy === 1) return;
+  for (const item of [...state.bugs, ...state.food]) {
+    item.x *= sx;
+    item.y *= sy;
+  }
+  state.habitat = { ...habitat };
+}
+
 /** A new, empty ecosystem waiting in the workshop for its two starters. */
 export function createSimulation(seed: number, habitat: Habitat = DEFAULT_HABITAT): SimulationState {
   return {
@@ -74,7 +104,7 @@ export function createSimulation(seed: number, habitat: Habitat = DEFAULT_HABITA
     habitat: { ...habitat },
     bugs: [],
     food: [],
-    foodTimerS: FOOD_SPAWN_INTERVAL_S,
+    foodTimerS: foodSpawnIntervalS(habitat),
     stats: emptyStats(),
   };
 }
@@ -159,7 +189,7 @@ export function restartEcosystem(state: SimulationState): void {
   state.endedAtS = null;
   state.bugs = [];
   state.food = [];
-  state.foodTimerS = FOOD_SPAWN_INTERVAL_S;
+  state.foodTimerS = foodSpawnIntervalS(state.habitat);
   state.stats = emptyStats();
 }
 
@@ -206,6 +236,18 @@ function threatTo(state: SimulationState, bug: Bug): Bug | null {
   return threat;
 }
 
+/** The wall a bug has walked through this step, and where it crossed, if any. */
+function wallCrossed(state: SimulationState, bug: Bug): { edge: HabitatEdge; point: { x: number; y: number } } | null {
+  const { width, height } = state.habitat;
+  const x = Math.min(width, Math.max(0, bug.x));
+  const y = Math.min(height, Math.max(0, bug.y));
+  if (bug.x < WALL_MARGIN) return { edge: 'left', point: { x: 0, y } };
+  if (bug.x > width - WALL_MARGIN) return { edge: 'right', point: { x: width, y } };
+  if (bug.y < WALL_MARGIN) return { edge: 'top', point: { x, y: 0 } };
+  if (bug.y > height - WALL_MARGIN) return { edge: 'bottom', point: { x, y: height } };
+  return null;
+}
+
 function keepInside(state: SimulationState, bug: Bug) {
   const { width, height } = state.habitat;
   if (bug.x < WALL_MARGIN || bug.x > width - WALL_MARGIN) {
@@ -219,7 +261,8 @@ function keepInside(state: SimulationState, bug: Bug) {
   bug.heading = wrapAngle(bug.heading);
 }
 
-function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number) {
+/** Moves a bug one step. Returns where it left the habitat if it walked out through an open edge. */
+function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number, canExit: ExitCheck | null) {
   let speed = bug.traits.behaviour.speed;
   const threat = threatTo(state, bug);
   if (threat) {
@@ -244,7 +287,10 @@ function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number) {
   }
   bug.x += Math.cos(bug.heading) * speed * dt;
   bug.y += Math.sin(bug.heading) * speed * dt;
+  const crossed = canExit ? wallCrossed(state, bug) : null;
+  if (crossed && canExit?.(crossed.point, crossed.edge)) return crossed;
   keepInside(state, bug);
+  return null;
 }
 
 function eat(state: SimulationState, bug: Bug, events: SimulationEvent[]) {
@@ -286,9 +332,9 @@ const deathCause = (bug: Bug): DeathCause | null =>
 
 /**
  * Advances the ecosystem by one fixed step, in place, and returns what happened. Does nothing
- * unless the ecosystem is running and not paused.
+ * unless the ecosystem is running and not paused. Walls bounce bugs back unless `canExit` opens them.
  */
-export function stepSimulation(state: SimulationState, dt: number = STEP_S): SimulationEvent[] {
+export function stepSimulation(state: SimulationState, { dt = STEP_S, canExit = null }: StepOptions = {}): SimulationEvent[] {
   if (state.status !== 'running' || state.paused) return [];
   const events: SimulationEvent[] = [];
   state.timeS += dt;
@@ -296,8 +342,8 @@ export function stepSimulation(state: SimulationState, dt: number = STEP_S): Sim
   withRandom(state, (rng) => {
     state.foodTimerS -= dt;
     if (state.foodTimerS <= 0) {
-      state.foodTimerS = FOOD_SPAWN_INTERVAL_S * rng.range(0.5, 1.5);
-      if (state.food.length < MAX_FOOD) events.push({ type: 'food-spawned', foodId: spawnFood(state, rng).id });
+      state.foodTimerS = foodSpawnIntervalS(state.habitat) * rng.range(0.5, 1.5);
+      if (state.food.length < maxFood(state.habitat)) events.push({ type: 'food-spawned', foodId: spawnFood(state, rng).id });
     }
     state.food = state.food.filter((food) => {
       if (state.timeS < food.expiresAtS) return true;
@@ -316,9 +362,15 @@ export function stepSimulation(state: SimulationState, dt: number = STEP_S): Sim
       return false;
     });
 
-    for (const bug of state.bugs) {
-      moveBug(state, bug, rng, dt);
-      eat(state, bug, events);
+    for (const bug of [...state.bugs]) {
+      const exitsOpen = canExit && state.bugs.length > MIN_HOME_POPULATION ? canExit : null;
+      const departed = moveBug(state, bug, rng, dt, exitsOpen);
+      if (departed) {
+        state.bugs = state.bugs.filter((other) => other !== bug);
+        events.push({ type: 'departed', bug, edge: departed.edge, ...departed.point });
+      } else {
+        eat(state, bug, events);
+      }
     }
     for (const bug of [...state.bugs]) {
       if (state.bugs.length >= MAX_POPULATION) break;
@@ -333,4 +385,28 @@ export function stepSimulation(state: SimulationState, dt: number = STEP_S): Sim
     events.push({ type: 'ecosystem-ended', survivors: state.bugs.length });
   }
   return events;
+}
+
+export const canAdmit = (state: SimulationState) =>
+  state.status === 'running' && !state.paused && state.bugs.length < MAX_POPULATION;
+
+/**
+ * Brings a bug in from elsewhere (the other phone, or back from a crossing that failed). It gets
+ * a new id here, since ids are only unique within one ecosystem, and keeps everything else.
+ */
+export function admitBug(state: SimulationState, bug: Bug, at: { x: number; y: number }, heading: number): Bug {
+  const { width, height } = state.habitat;
+  const admitted: Bug = {
+    ...bug,
+    id: nextId(state, 'bug'),
+    x: Math.min(width - WALL_MARGIN, Math.max(WALL_MARGIN, at.x)),
+    y: Math.min(height - WALL_MARGIN, Math.max(WALL_MARGIN, at.y)),
+    heading: wrapAngle(heading),
+    targetFoodId: null,
+    fleeS: 0,
+  };
+  state.bugs.push(admitted);
+  state.stats.peakPopulation = Math.max(state.stats.peakPopulation, state.bugs.length);
+  state.stats.maxGeneration = Math.max(state.stats.maxGeneration, admitted.generation);
+  return admitted;
 }

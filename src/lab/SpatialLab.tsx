@@ -3,7 +3,6 @@ import {
   Animated,
   Dimensions,
   Easing,
-  GestureResponderEvent,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -52,6 +51,7 @@ import {
   TouchSample,
 } from '../spatial/Stitch';
 import { DistanceFilter, FilteredDistance } from '../state/DistanceFilter';
+import { JoinOverlay } from '../ui/JoinOverlay';
 
 const CONNECTION_STATES: ConnectionState[] = ['disconnected', 'connecting', 'connected', 'recovering'];
 /** Swipe halves older than this can no longer pair with a new one. */
@@ -347,70 +347,6 @@ function LinkAnimation({ path, onDone }: { path: LinkPath; onDone: () => void })
           transform: [{ scale: settle.interpolate({ inputRange: [0, 1], outputRange: [0.3, 3.2] }) }],
         }]}
       />
-    </View>
-  );
-}
-
-/**
- * Full-screen catcher for the join swipe. Both phones show it at once; the finger's trail on
- * each screen is read for where it left or arrived, and Phone A pairs the two halves.
- */
-function JoinOverlay({
-  role,
-  note,
-  status,
-  onSwipe,
-  onClose,
-}: {
-  role: PhoneRole | null;
-  note: string | null;
-  status: string;
-  onSwipe: (trail: TouchSample[], startedAt: number, endedAt: number) => void;
-  onClose: () => void;
-}) {
-  const trail = useRef<TouchSample[]>([]);
-  const startedAt = useRef(0);
-  const sample = (event: GestureResponderEvent): TouchSample => ({
-    xPt: event.nativeEvent.pageX,
-    yPt: event.nativeEvent.pageY,
-    tMs: event.nativeEvent.timestamp,
-  });
-  const finish = () => {
-    const samples = trail.current;
-    trail.current = [];
-    if (samples.length > 1) onSwipe(samples, startedAt.current, Date.now());
-  };
-
-  return (
-    <View
-      style={styles.joinOverlay}
-      onStartShouldSetResponder={() => true}
-      onMoveShouldSetResponder={() => true}
-      onResponderTerminationRequest={() => false}
-      onResponderGrant={(event) => {
-        startedAt.current = Date.now();
-        trail.current = [sample(event)];
-      }}
-      onResponderMove={(event) => { trail.current.push(sample(event)); }}
-      onResponderRelease={(event) => {
-        trail.current.push(sample(event));
-        finish();
-      }}
-      onResponderTerminate={finish}
-    >
-      <View pointerEvents="none" style={styles.joinCopy}>
-        <Text style={styles.eyebrow}>{role ? `PHONE ${role}` : 'NOT CONNECTED'}</Text>
-        <Text style={styles.joinTitle}>Swipe across{'\n'}both screens</Text>
-        <Text style={styles.joinChevrons}>›  ›  ›</Text>
-        <Text style={styles.joinHint}>
-          Lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.
-        </Text>
-        <Text style={styles.joinStatus}>{status}</Text>
-        {note && <Text style={styles.joinNote}>{note}</Text>}
-      </View>
-      <TouchableOpacity style={styles.joinClose} onPress={onClose}>
-        <Text style={styles.secondaryText}>Not now</Text>
-      </TouchableOpacity>
     </View>
   );
 }
@@ -909,14 +845,6 @@ const styles = StyleSheet.create({
   joinButton: { borderRadius: 14, borderWidth: 1, borderColor: '#80aaff', paddingVertical: 14, alignItems: 'center' },
   joinButtonDisabled: { borderColor: '#35404d' },
   joinButtonText: { color: '#80aaff', fontWeight: '800' },
-  joinOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#0b0d10', justifyContent: 'center', paddingHorizontal: 32 },
-  joinCopy: { gap: 14 },
-  joinTitle: { color: '#f4f6f8', fontSize: 38, fontWeight: '800', letterSpacing: -1 },
-  joinChevrons: { color: '#80aaff', fontSize: 34, fontWeight: '800' },
-  joinHint: { color: '#8993a1', fontSize: 14, lineHeight: 20 },
-  joinStatus: { color: '#d8e0ea', fontSize: 13, fontWeight: '700' },
-  joinNote: { color: '#f0b36f', fontSize: 13, fontWeight: '700' },
-  joinClose: { position: 'absolute', bottom: 60, alignSelf: 'center', paddingHorizontal: 22, paddingVertical: 12, borderRadius: 14, borderWidth: 1, borderColor: '#35404d' },
   linkLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   linkRing: { position: 'absolute', width: LINK_RING_SIZE, height: LINK_RING_SIZE, borderRadius: LINK_RING_SIZE / 2, borderWidth: 2 },
   linkBeam: { position: 'absolute', height: 4, borderRadius: 2, transformOrigin: 'left center', shadowOpacity: 0.9, shadowRadius: 10, shadowOffset: { width: 0, height: 0 } },

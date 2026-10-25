@@ -2,13 +2,19 @@ import { Random } from '../src/game/Random';
 import {
   CONTACT_RADIUS,
   createSimulation,
+  DEFAULT_HABITAT,
   defaultStarterTraits,
   EAT_RADIUS,
   FOOD_SATIETY,
+  FOOD_SPAWN_INTERVAL_S,
+  foodSpawnIntervalS,
+  habitatForScreen,
   MATURITY_FRACTION,
   MAX_FOOD,
+  maxFood,
   OFFSPRING_SATIETY,
   releaseStarters,
+  resizeHabitat,
   restartEcosystem,
   rollStarterTraits,
   setPaused,
@@ -392,5 +398,30 @@ describe('long run', () => {
     expect(events.some((event) => event.type === 'born')).toBe(true);
     expect(events.some((event) => event.type === 'died')).toBe(true);
     expect(state.stats.maxGeneration).toBeGreaterThan(1);
+  });
+});
+
+describe('screen-shaped habitats', () => {
+  test('a habitat takes the screen\'s proportions at a fixed width', () => {
+    expect(habitatForScreen(402, 874)).toEqual({ width: 360, height: 783 });
+    expect(habitatForScreen(428, 926)).toEqual({ width: 360, height: 779 });
+  });
+
+  test('a taller habitat gets proportionally more food, sooner', () => {
+    const tall = habitatForScreen(402, 874);
+    expect(maxFood(DEFAULT_HABITAT)).toBe(MAX_FOOD);
+    expect(maxFood(tall)).toBe(Math.round(MAX_FOOD * 783 / 520));
+    expect(foodSpawnIntervalS(tall)).toBeCloseTo(FOOD_SPAWN_INTERVAL_S * 520 / 783, 9);
+  });
+
+  test('resizing keeps bugs and food in the same relative place', () => {
+    const state = running();
+    const [bug] = state.bugs;
+    place(bug, 180, 260);
+    state.food = [{ id: 'f', x: 90, y: 130, spawnedAtS: 0, expiresAtS: 1e6 }];
+    resizeHabitat(state, { width: 360, height: 780 });
+    expect(state.habitat).toEqual({ width: 360, height: 780 });
+    expect([bug.x, bug.y]).toEqual([180, 390]);
+    expect([state.food[0].x, state.food[0].y]).toEqual([90, 195]);
   });
 });
