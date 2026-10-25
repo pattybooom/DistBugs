@@ -20,6 +20,7 @@ from screen_calibration import ScreenAnchor
 from smoothing import PoseSmoother
 
 ROOT = Path(__file__).resolve().parent
+DEBUG_DIR = ROOT / 'debug'
 REFERENCE_IDS = (10, 11, 12, 13)  # top-left, top-right, bottom-right, bottom-left
 
 
@@ -82,14 +83,30 @@ def detector():
     return cv2.aruco.ArucoDetector(dictionary(), parameters)
 
 
-def detect(frame, reader):
-    corners, ids, _ = reader.detectMarkers(frame)
+def detect(frame, reader, rejected=None):
+    corners, ids, rejects = reader.detectMarkers(frame)
+    if rejected is not None:
+        rejected.extend(candidate.reshape(4, 2) for candidate in rejects)
     result = {}
     if ids is not None:
         for marker, points in zip(ids.flatten(), corners):
             if int(marker) in result:
                 raise ValueError(f"Duplicate marker ID {marker}")
             result[int(marker)] = points.reshape(4, 2)
+    return result
+
+
+def near_misses(rejected, found):
+    """Square-ish candidates the detector saw but could not read, away from the squares it did find."""
+    centres = [corners.mean(axis=0) for corners in found.values()]
+    result = []
+    for candidate in rejected:
+        sides = np.linalg.norm(candidate - np.roll(candidate, -1, axis=0), axis=1)
+        if sides.min() < 8 or sides.max() > 1.8 * sides.min() or sides.max() > 400:
+            continue
+        if any(np.linalg.norm(candidate.mean(axis=0) - centre) < sides.max() for centre in centres):
+            continue
+        result.append(candidate)
     return result
 
 
@@ -311,9 +328,11 @@ async def run(args, config):
                 last_tick = start
                 ok, frame = await asyncio.to_thread(cap.read)
                 markers, phones, invalid = {}, [], None
+                rejected = []
+                raw = frame.copy() if ok else None
                 if ok:
                     try:
-                        markers = detect(frame, reader)
+                        markers = detect(frame, reader, rejected)
                         if matrix is None:
                             roles = {s['role'] for s in clients.values() if s['mode'] == 'swipe' and s['markerOnScreen'] and time.monotonic() - s['seen'] <= 1.2}
                             if roles == {'A', 'B'}:
@@ -375,6 +394,8 @@ async def run(args, config):
                     note = f'{live_message["reason"] if swipe_roles or calibration.get("mode") in ("manual", "screen") else message["reason"]} · clients {len(clients)} · {rate:.0f} fps'
                     if calibration.get('mode') in ('manual', 'screen'):
                         note += ' · R reset reference · Q quit'
+                    misses = near_misses(rejected, markers)
+                    note += f' · {len(misses)} near-miss (red) · S saves the frame'
                     # How big each square looks to the camera, to tell "too small" from "not found".
                     for spec in config['phones']:
                         corners = markers.get(spec['marker_id'])
@@ -383,6 +404,8 @@ async def run(args, config):
                     if gap is not None:
                         note += f' · gap {gap:.2f} cm'
                     draw(frame, markers, phones, note, matrix)
+                    if misses:
+                        cv2.polylines(frame, [candidate.astype(np.int32) for candidate in misses], True, (0, 0, 255), 1)
                     if centre_distance is not None:
                         checks = f'Centres {centre_distance:.2f} cm | relative turn {relative_yaw:.1f} deg | jitter {gate.jitter_cm:.3f} cm'
                         if args.check_distance_cm is not None:
@@ -394,6 +417,11 @@ async def run(args, config):
                         cv2.putText(frame, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
                     cv2.imshow(window_name, frame)
                     key = cv2.waitKey(1) & 0xff
+                    if key == ord('s') and raw is not None:
+                        DEBUG_DIR.mkdir(exist_ok=True)
+                        saved = DEBUG_DIR / time.strftime('frame-%H%M%S.png')
+                        cv2.imwrite(str(saved), raw)
+                        print(f'Saved the raw camera frame to {saved} (it stays on this Mac)', flush=True)
                     if key == ord('r') and getattr(args, 'command', None) == 'swipe':
                         if auto_anchor:
                             matrix = None
