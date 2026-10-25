@@ -8,7 +8,7 @@ DistBugs is a two-phone last-bug-standing battle game. Each player builds one st
 - **Aggression.** Higher aggression makes a bug choose enemies sooner, deal more damage, attack on a shorter cooldown, and resist retreating. It also increases hunger drain and risk. The old rule—fleeing from a clearly more aggressive hungry bug—is retained as a low-health threat response, but aggression now has direct combat consequences.
 - **Powers.** Choose one signature power: dash, shield, stun pulse, regeneration, or frenzy. Powers have deterministic cooldowns and visible effects in the battle HUD and event log.
 - **Arena generation.** Every ecosystem has a saved seed, biome, water, hazards, cover, structures, and spawn points. The same seed generates the same arena on both phones. Water and structures block movement; food is spawned more frequently to keep fights moving.
-- **Victory.** A battle ends when either the local or remote bug is defeated. The result is persisted and shown as a win, loss, or draw.
+- **Battle persistence.** Combat continues without automatically declaring a winner or ending the battle when one side has no surviving bugs. Ecosystem mode retains its existing population-end condition.
 
 The original autonomous two-starter ecosystem remains available to legacy saves and tests as a compatibility mode, but new releases use battle mode.
 
@@ -29,6 +29,8 @@ The simulation (`src/game/`) is plain TypeScript with no React Native imports. I
 The ecosystem is saved with AsyncStorage on every birth and death, at least every 15 s while running, when pausing, and when the app leaves the foreground. Leaving the foreground also pauses it, so no simulated time passes while the app is closed; on the next launch it is restored paused and *Resume* carries on.
 
 ## Linking two phones
+
+**MacBook camera prototype:** Both phones can now join automatically from printed markers viewed by a calibrated MacBook webcam. See [camera setup, printing, calibration, and run instructions](tools/camera-join/README.md). The camera option is available in Link and Spatial Lab; the swipe flow below remains the fallback. Hardware accuracy and iPhone network behavior still need live validation.
 
 Two phones can join their habitats so bugs walk from one to the other. Open **Link** on both phones and connect from one; the phone that connects is Phone A. Lay the phones flat with their edges touching and swipe one finger from one screen onto the other, the same swipe join the Spatial Lab uses (`Stitch.ts`). Once joined, the open stretches of each habitat's walls glow blue along the screen's edge.
 

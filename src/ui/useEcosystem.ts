@@ -86,8 +86,6 @@ export function useEcosystem(visible: boolean): Ecosystem {
         onDeparted.current?.(event);
       } else if (event.type === 'ecosystem-ended') {
         entries.push({ text: event.survivors === 1 ? 'One bug left: the ecosystem has ended' : 'No bugs left: the ecosystem has ended', tone: 'info' });
-      } else if (event.type === 'battle-ended') {
-        entries.push({ text: event.winner ? `${event.winner === 'local' ? 'You win' : 'Opponent wins'} · battle ended` : 'Draw · battle ended', tone: event.winner === 'local' ? 'birth' : 'death' });
       }
     }
     if (driverRef.current?.state) playEvents(events, driverRef.current.state.soundEnabled, driverRef.current.state.arena.biome);

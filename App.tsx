@@ -1,11 +1,12 @@
 import { StatusBar } from 'expo-status-bar';
 import { useState } from 'react';
 import SpatialLab from './src/lab/SpatialLab';
+import SwipeScreen from './src/ui/SwipeScreen';
 import { EcosystemScreen } from './src/ui/EcosystemScreen';
 import { useBugBridge } from './src/ui/useBugBridge';
 import { useEcosystem } from './src/ui/useEcosystem';
 
-type Screen = 'ecosystem' | 'lab';
+type Screen = 'ecosystem' | 'lab' | 'swipe';
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('ecosystem');
@@ -18,7 +19,9 @@ export default function App() {
     <>
       <StatusBar style="light" />
       {screen === 'lab'
-        ? <SpatialLab onExit={() => setScreen('ecosystem')} />
+        ? <SpatialLab onExit={() => setScreen('ecosystem')} onOpenSwipe={() => setScreen('swipe')} />
+        : screen === 'swipe'
+          ? <SwipeScreen onExit={() => setScreen('lab')} />
         : <EcosystemScreen ecosystem={ecosystem} bridge={bridge} onOpenLab={() => setScreen('lab')} />}
     </>
   );

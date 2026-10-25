@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { useCameraJoin } from '../ui/useCameraJoin';
+import { CameraJoinControls } from '../ui/CameraJoinControls';
 import {
   Animated,
   Dimensions,
@@ -229,7 +231,7 @@ function PositionScene({
         <Text style={styles.sceneFooterText}>
           {layout
             ? `${formatDistance(layout.distanceCm)} CENTRE TO CENTRE · ${layout.touching ? 'TOUCHING' : `GAP ${formatDistance(layout.gapCm)}`}${notes ? ` · ${notes}` : ''}`
-            : 'Waiting for a swipe across both screens'}
+            : 'Waiting for a camera layout or swipe join'}
         </Text>
         <Text style={styles.sceneScaleText}>{`PHONES TO SCALE · 10 cm = ${Math.round(pixelsPerCm * 10)} px · +Y = PHONE A AT START`}</Text>
       </View>
@@ -352,7 +354,7 @@ function LinkAnimation({ path, onDone }: { path: LinkPath; onDone: () => void })
 }
 
 /** The two-phone Nearby Interaction prototype, kept as a separate experiment beside the ecosystem. */
-export default function SpatialLab({ onExit }: { onExit: () => void }) {
+export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void; onOpenSwipe?: () => void }) {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [connection, setConnection] = useState<ConnectionState>('disconnected');
   const [localRole, setLocalRole] = useState<PhoneRole | null>(null);
@@ -378,6 +380,16 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   const swipeReports = useRef<SwipeReport[]>([]);
   const rangingRequested = useRef(false);
   const screen = useWindowDimensions();
+  const cameraMode = useRef(false);
+  const camera = useCameraJoin(connection === 'connected' && localRole !== null, localRole, stitch => {
+    applyStitchState({ stitch, status: 'joined' });
+    setJoinNote(null);
+  }, reason => {
+    applyStitchState(null);
+    setJoinOpen(true);
+    setJoinNote(reason);
+  });
+  cameraMode.current = camera.enabled;
 
   const addLog = (message: string) => setLogs((current) => [message, ...current].slice(0, 32));
   const reportActionError = (error: unknown) => addLog(`Error: ${error instanceof Error ? error.message : String(error)}`);
@@ -421,6 +433,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
 
   const markMoved = (reason: string) => {
     const current = stitchRef.current;
+    if (current?.stitch.source === 'camera') return;
     if (!current || current.status !== 'joined' || localRoleRef.current !== 'A') return;
     publishStitchState({ ...current, status: 'moved', reason });
     addLog(`Join lost: ${reason}`);
@@ -447,6 +460,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   /** UWB is only a tripwire: it compares its change since the join with the change rotation explains. */
   const checkMoved = (filtered: FilteredDistance, at: number) => {
     const state = stitchRef.current;
+    if (state?.stitch.source === 'camera') return;
     if (!state || state.status !== 'joined' || filtered.smoothedCm == null) return;
     const placed = stitchedLayout(state.stitch, headingOf(motionsRef.current.A), headingOf(motionsRef.current.B));
     if (placed.headingA == null || placed.headingB == null) return;
@@ -512,6 +526,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
         if (joinedFrame != null && event.frameId != null && event.frameId !== joinedFrame) markMoved(`motion restarted on Phone ${role}`);
       }),
       ParallaxModule.onPeerMessage((event) => {
+        if (cameraMode.current) return;
         const message = parseStitchMessage(event.message);
         if (!message) return;
         if (message.type === 'swipe') {
@@ -545,6 +560,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   }, []);
 
   const handleSwipe = (trail: TouchSample[], startedAt: number, endedAt: number) => {
+    if (cameraMode.current) return;
     const role = localRoleRef.current;
     if (!role) {
       setJoinNote('Connect the phones first');
@@ -577,7 +593,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   const distance = distanceFilter.current.current(now);
   const ownMeasurement = localRole ? measurements[localRole] ?? null : null;
   const fresh = isFresh(ownMeasurement?.receivedAt, now);
-  const headingA = headingOf(motionA);
+  const headingA = stitchState?.stitch.source === 'camera' ? Math.PI / 2 : headingOf(motionA);
   const placed = stitchState ? stitchedLayout(stitchState.stitch, headingA, headingOf(motionB)) : null;
   const headingB = placed?.headingB ?? null;
   const connected = connection === 'connected';
@@ -587,7 +603,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
     yCm: null,
     bearingRad: null,
     distanceCm: null,
-    reason: connected ? 'swipe across both screens to join' : 'connect the phones first',
+    reason: connected ? camera.enabled ? camera.status : 'swipe across both screens to join' : 'connect the phones first',
   };
   const joined = stitchState?.status === 'joined';
 
@@ -596,7 +612,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   }, [headingA, upHeading]);
 
   const bearingToB = position.source === 'unknown' ? null : position.bearingRad;
-  const relativeRotationLabel = headingA != null && headingB != null ? `${formatDegrees(wrapAngle(headingB - headingA))} · GYRO` : 'UNKNOWN';
+  const relativeRotationLabel = headingA != null && headingB != null ? `${formatDegrees(wrapAngle(headingB - headingA))} · ${stitchState?.stitch.source === 'camera' ? 'CAMERA' : 'GYRO'}` : 'UNKNOWN';
   const frames = [motionA?.referenceFrame, motionB?.referenceFrame];
   const frameStatus = frames.some((frame) => frame === 'xMagneticNorthZVertical')
     ? 'MAGNETIC · REBUILD FOR GYRO-ONLY YAW'
@@ -606,14 +622,14 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
   const geometryLabel = !stitchState
     ? 'NOT JOINED'
     : joined
-      ? `JOINED · SWIPE ${stitchState.stitch.from} → ${stitchState.stitch.from === 'A' ? 'B' : 'A'}${stitchState.stitch.snapped ? ' · SQUARE' : ''}`
+      ? stitchState.stitch.source === 'camera' ? 'JOINED · MACBOOK CAMERA' : `JOINED · SWIPE ${stitchState.stitch.from} → ${stitchState.stitch.from === 'A' ? 'B' : 'A'}${stitchState.stitch.snapped ? ' · SQUARE' : ''}`
       : `MOVED · ${(stitchState.reason ?? 'swipe again').toUpperCase()}`;
-  const uwbCheckLabel = !joined
+  const uwbCheckLabel = stitchState?.stitch.source === 'camera' ? 'CAMERA GEOMETRY' : !joined
     ? '—'
     : uwbResidualCm == null
       ? 'SETTLING'
       : `${uwbResidualCm >= 0 ? '+' : ''}${uwbResidualCm.toFixed(1)} cm · LIMIT ±${MOVED_THRESHOLD_CM} cm`;
-  const joinStatus = !localRole
+  const joinStatus = camera.enabled ? camera.status : !localRole
     ? 'Waiting for the connection'
     : joined
       ? 'Joined'
@@ -621,7 +637,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
         ? `Join lost: ${stitchState.reason ?? 'swipe again'}`
         : localRole === 'A' ? 'Waiting for a swipe' : 'Waiting for a swipe · Phone A pairs them';
   // The map turns as a whole so Phone A's starting direction points up (+Y); the geometry is unchanged.
-  const sceneRotation = viewRotation(upHeading);
+  const sceneRotation = viewRotation(stitchState?.stitch.source === 'camera' ? Math.PI / 2 : upHeading);
   const turnForScene = (heading: number | null) => heading == null ? null : wrapAngle(heading + sceneRotation);
   // Multipeer stays connected while Nearby Interaction recovers, so ranging can be restarted then too.
   const canRange = connected || connection === 'recovering';
@@ -633,6 +649,9 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
           <TouchableOpacity style={styles.exitButton} onPress={onExit}>
             <Text style={styles.exitButtonText}>‹ Ecosystem</Text>
           </TouchableOpacity>
+          {onOpenSwipe && <TouchableOpacity style={styles.swipeButton} onPress={onOpenSwipe}>
+            <Text style={styles.swipeButtonText}>Open Swipe demo ↗</Text>
+          </TouchableOpacity>}
           <View style={styles.header}>
             <View>
               <Text style={styles.eyebrow}>SPATIAL LAB · PARALLAX M2 · RELATIVE SPACE</Text>
@@ -710,13 +729,14 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
           </View>
 
           <View style={styles.joinPanel}>
-            <Text style={styles.label}>SWIPE JOIN</Text>
+            <Text style={styles.label}>CAMERA JOIN</Text>
+            <CameraJoinControls camera={camera} role={localRole} />
             <Text style={styles.joinPanelHint}>
-              Lay the phones flat with their edges touching and drag one finger from one screen straight onto the other.
-              Turning either phone afterwards is followed by its gyroscope. Sliding one away is noticed by UWB, which asks for a new swipe.
+              Position both phones under the calibrated MacBook camera. Attach the matching printed marker to each phone.
+              Camera tracking rejoins automatically after a move. Disable the camera to use the swipe fallback.
             </Text>
-            <TouchableOpacity disabled={!canRange} style={[styles.joinButton, !canRange && styles.joinButtonDisabled]} onPress={requestJoin}>
-              <Text style={styles.joinButtonText}>{stitchState ? 'Join again' : 'Swipe to join'}</Text>
+            <TouchableOpacity disabled={!canRange || camera.enabled} style={[styles.joinButton, (!canRange || camera.enabled) && styles.joinButtonDisabled]} onPress={requestJoin}>
+              <Text style={styles.joinButtonText}>Swipe fallback</Text>
             </TouchableOpacity>
           </View>
 
@@ -735,7 +755,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
                 ? `B AT ${formatDistance(Math.hypot(stitchState.stitch.centreB.xCm, stitchState.stitch.centreB.yCm))} · TURNED ${formatDegrees(stitchState.stitch.relativeYawRad)} · OFFSET ${formatDegrees(stitchState.stitch.yawOffsetRad)}`
                 : '—'}
             />
-            <DiagnosticRow label="CAMERA" value={capabilities ? `NOT USED · ${capabilities.cameraAssistanceSupported ? 'AVAILABLE' : 'UNAVAILABLE'}` : 'LOADING'} />
+            <DiagnosticRow label="CAMERA" value={camera.enabled ? camera.status : 'MACBOOK CAMERA OFF'} />
             <DiagnosticRow
               label="CAPABILITIES"
               value={capabilities
@@ -750,7 +770,7 @@ export default function SpatialLab({ onExit }: { onExit: () => void }) {
           </View>
         </ScrollView>
       </SafeAreaView>
-      {joinOpen && <JoinOverlay role={localRole} note={joinNote} status={joinStatus} onSwipe={handleSwipe} onClose={() => setJoinOpen(false)} />}
+      {joinOpen && <JoinOverlay role={localRole} note={joinNote} status={joinStatus} onSwipe={handleSwipe} onClose={() => setJoinOpen(false)} camera={camera} />}
       {linkPath && <LinkAnimation key={linkPath.id} path={linkPath} onDone={() => setLinkPath(null)} />}
     </View>
   );
@@ -763,6 +783,8 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingTop: 10 },
   exitButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingRight: 12 },
   exitButtonText: { color: '#80aaff', fontSize: 14, fontWeight: '700' },
+  swipeButton: { alignSelf: 'flex-start', backgroundColor: '#263b59', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 13 },
+  swipeButtonText: { color: '#cfe2ff', fontSize: 12, fontWeight: '800' },
   eyebrow: { color: '#80aaff', fontSize: 10, fontWeight: '800', letterSpacing: 1.5 },
   title: { color: '#f4f6f8', fontSize: 30, fontWeight: '800', letterSpacing: -0.8, marginTop: 6 },
   subtitle: { color: '#8993a1', fontSize: 13, marginTop: 5, maxWidth: 280 },

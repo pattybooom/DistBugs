@@ -54,6 +54,8 @@ export type SwipeReport = EdgeCrossing & {
 };
 
 export type Stitch = {
+  source?: 'camera' | 'swipe';
+  screenSizesCm?: Record<PhoneRole, { width: number; height: number }>;
   id: string;
   createdAt: number;
   /** Phone B's centre in Phone A's motion reference frame, in cm; Phone A's centre is the origin. */
@@ -243,21 +245,21 @@ export function stitchedLayout(stitch: Stitch, headingA: number | null, ownHeadi
       yCm,
       bearingRad: Math.atan2(yCm, xCm),
       distanceCm: Math.hypot(xCm, yCm),
-      reason: 'swipe join',
+      reason: stitch.source === 'camera' ? 'camera join' : 'swipe join',
     },
-    headingA,
-    headingB: ownHeadingB == null ? null : wrapAngle(ownHeadingB + stitch.yawOffsetRad),
+    headingA: stitch.source === 'camera' ? Math.PI / 2 : headingA,
+    headingB: stitch.source === 'camera' ? Math.PI / 2 + stitch.relativeYawRad : ownHeadingB == null ? null : wrapAngle(ownHeadingB + stitch.yawOffsetRad),
   };
 }
 
 /** A screen's place on the table: its centre in mm and its top edge's heading, both in Phone A's motion frame. */
-export type ScreenPose = { centreMm: PointMm; headingRad: number };
+export type ScreenPose = { centreMm: PointMm; headingRad: number; screenSizeCm?: { width: number; height: number } };
 
 /** Both screens on the table, from a join and both phones' current headings in Phone A's frame. */
 export function screenPoses(stitch: Stitch, headingA: number, headingB: number): Record<PhoneRole, ScreenPose> {
   return {
-    A: { centreMm: { x: 0, y: 0 }, headingRad: headingA },
-    B: { centreMm: { x: stitch.centreB.xCm * 10, y: stitch.centreB.yCm * 10 }, headingRad: headingB },
+    A: { centreMm: { x: 0, y: 0 }, headingRad: headingA, screenSizeCm: stitch.screenSizesCm?.A },
+    B: { centreMm: { x: stitch.centreB.xCm * 10, y: stitch.centreB.yCm * 10 }, headingRad: headingB, screenSizeCm: stitch.screenSizesCm?.B },
   };
 }
 
@@ -268,7 +270,9 @@ export function screenPoses(stitch: Stitch, headingA: number, headingB: number):
  */
 export function tableToScreen(point: PointMm, pose: ScreenPose, screen: ScreenSize, pointsPerMm = POINTS_PER_MM): { xPt: number; yPt: number } {
   const local = rotate({ x: point.x - pose.centreMm.x, y: point.y - pose.centreMm.y }, Math.PI / 2 - pose.headingRad);
-  return { xPt: screen.widthPt / 2 + local.x * pointsPerMm, yPt: screen.heightPt / 2 - local.y * pointsPerMm };
+  const scaleX = pose.screenSizeCm ? screen.widthPt / (pose.screenSizeCm.width * 10) : pointsPerMm;
+  const scaleY = pose.screenSizeCm ? screen.heightPt / (pose.screenSizeCm.height * 10) : pointsPerMm;
+  return { xPt: screen.widthPt / 2 + local.x * scaleX, yPt: screen.heightPt / 2 - local.y * scaleY };
 }
 
 /** Antenna-to-antenna distance the join predicts, for comparison with UWB; headings are in A's frame. */

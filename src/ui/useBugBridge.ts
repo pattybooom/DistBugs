@@ -27,6 +27,7 @@ import {
   TouchSample,
 } from '../spatial/Stitch';
 import { DepartedEvent, Ecosystem } from './useEcosystem';
+import { CameraJoinControls, useCameraJoin } from './useCameraJoin';
 
 /** A bug the other phone hasn't confirmed by now comes back. */
 const TRANSFER_TIMEOUT_MS = 4000;
@@ -36,6 +37,7 @@ const SWIPE_REPORT_LIFETIME_MS = 3000;
 export type LinkStatus = 'off' | 'searching' | 'connecting' | 'connected' | 'joined';
 
 export type BugBridge = {
+  camera: CameraJoinControls;
   status: LinkStatus;
   role: PhoneRole | null;
   peers: Peer[];
@@ -98,6 +100,20 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   const nextTransfer = useRef(1);
 
   const active = enabled && visible;
+  const cameraMode = useRef(false);
+  const camera = useCameraJoin(active && connection === 'connected' && role !== null, role, next => {
+    setStitch(next);
+    setJoinOpen(false);
+    setJoinNote(null);
+  }, reason => {
+    // Clear the live crossing ref synchronously so no bug can leave on stale geometry.
+    linkRef.current = null;
+    ecosystemRef.current.setCrossing(null, null);
+    setGates([]); setStitch(null);
+    if (roleRef.current) setJoinOpen(true);
+    setJoinNote(reason);
+  });
+  cameraMode.current = camera.enabled;
 
   const send = (message: StitchMessage | CrossingMessage, serialized: string) =>
     ParallaxModule.sendPeerMessage(serialized).catch((error) => {
@@ -144,6 +160,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   const handleMessage = (text: string) => {
     const stitchMessage = parseStitchMessage(text);
     if (stitchMessage) {
+      if (cameraMode.current) return;
       if (stitchMessage.type === 'swipe') {
         // Phone A pairs the halves; the other phone says how long ago its finger crossed.
         if (roleRef.current === 'A') addSwipeReport({ ...stitchMessage.report, atMs: Date.now() - stitchMessage.ageMs });
@@ -206,6 +223,8 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
           setJoinOpen(true);
         }
         if (state === 'disconnected') {
+          linkRef.current = null;
+          ecosystemRef.current.setCrossing(null, null);
           bounceAll();
           swipeReports.current = [];
           setStitch(null);
@@ -227,6 +246,8 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
     return () => {
       clearInterval(timeouts);
       subscriptions.forEach((subscription) => subscription.remove());
+      linkRef.current = null;
+      ecosystemRef.current.setCrossing(null, null);
       bounceAll();
       void ParallaxModule.stopDiscovery();
       void ParallaxModule.disconnect().catch(() => undefined);
@@ -244,7 +265,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
 
   // Opens the walls whenever both phones' layouts and the join are known.
   useEffect(() => {
-    const link = stitch && role && ownLayout && otherLayout ? { ...crossingPoses(stitch, role), ownLayout, otherLayout } : null;
+    const link = active && connection === 'connected' && stitch && role && ownLayout && otherLayout ? { ...crossingPoses(stitch, role), ownLayout, otherLayout } : null;
     linkRef.current = link;
     if (!link) {
       ecosystem.setCrossing(null, null);
@@ -253,7 +274,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
     }
     ecosystem.setCrossing((point, edge) => crossingLanding(link, point, edge, 0) != null, sendBug);
     setGates(openGates(link));
-  }, [stitch, role, ownLayout, otherLayout, ecosystem.setCrossing, sendBug]);
+  }, [active, connection, stitch, role, ownLayout, otherLayout, ecosystem.setCrossing, sendBug]);
 
   // Tells the other phone whenever this habitat moves on screen.
   useEffect(() => {
@@ -267,6 +288,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   }, []);
 
   const handleSwipe = (trail: TouchSample[], startedAt: number, endedAt: number) => {
+    if (cameraMode.current) return;
     const current = roleRef.current;
     if (!current) {
       setJoinNote('Connect the phones first');
@@ -289,13 +311,14 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
 
   const connected = connection === 'connected' || connection === 'recovering';
   const status: LinkStatus = !enabled ? 'off' : connected ? (stitch ? 'joined' : 'connected') : connection === 'connecting' ? 'connecting' : 'searching';
-  const joinStatus = !role
+  const joinStatus = camera.enabled ? camera.status : !role
     ? 'Waiting for the connection'
     : stitch
       ? 'Joined'
       : role === 'A' ? 'Waiting for a swipe' : 'Waiting for a swipe · Phone A pairs them';
 
   return {
+    camera,
     status,
     role,
     peers,

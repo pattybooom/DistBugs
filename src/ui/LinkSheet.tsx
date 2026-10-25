@@ -1,6 +1,7 @@
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { COLORS, PIXEL_FONT } from './theme';
 import { BugBridge } from './useBugBridge';
+import { CameraJoinControls } from './CameraJoinControls';
 
 const STATUS_TEXT: Record<BugBridge['status'], string> = {
   off: 'Off',
@@ -20,7 +21,7 @@ export function LinkSheet({ bridge, onClose }: { bridge: BugBridge; onClose: () 
         <TouchableOpacity onPress={onClose} hitSlop={10}><Text style={styles.close}>✕</Text></TouchableOpacity>
       </View>
       <Text style={styles.hint}>
-        Open Link on both phones and connect from one. Lay them flat, edges touching, and swipe across both screens.
+        Open Link on both phones and connect from one. Position both phones under the calibrated MacBook camera.
         Bugs that walk off the touching edge cross to the other phone.
       </Text>
       <Text style={[styles.status, bridge.status === 'joined' && styles.statusJoined]}>
@@ -47,8 +48,12 @@ export function LinkSheet({ bridge, onClose }: { bridge: BugBridge; onClose: () 
       )}
 
       {connected && (
+        <CameraJoinControls camera={bridge.camera} role={bridge.role} />
+      )}
+
+      {connected && !bridge.camera.enabled && (
         <TouchableOpacity style={styles.primary} onPress={bridge.requestJoin}>
-          <Text style={styles.primaryText}>{bridge.status === 'joined' ? 'Join again' : 'Swipe to join'}</Text>
+          <Text style={styles.primaryText}>{bridge.status === 'joined' ? 'Join again with swipe' : 'Swipe fallback'}</Text>
         </TouchableOpacity>
       )}
 

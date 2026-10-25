@@ -1,0 +1,11 @@
+{
+  "dictionary": "DICT_4X4_50",
+  "reference_width_cm": 32.0,
+  "reference_height_cm": 18.0,
+  "reference_marker_cm": 3.0,
+  "phone_marker_cm": 3.0,
+  "phones": [
+    { "role": "A", "marker_id": 0, "width_cm": 6.49, "height_cm": 14.09, "marker_offset_cm": [0, 0], "marker_rotation_deg": 0 },
+    { "role": "B", "marker_id": 1, "width_cm": 7.13, "height_cm": 15.45, "marker_offset_cm": [0, 0], "marker_rotation_deg": 0 }
+  ]
+}

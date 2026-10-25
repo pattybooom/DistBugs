@@ -56,7 +56,9 @@ export function crossingPoses(stitch: Stitch, role: 'A' | 'B'): { own: ScreenPos
 
 /** Inverse of `tableToScreen`. */
 export function screenToTable(point: { xPt: number; yPt: number }, pose: ScreenPose, screen: ScreenSize, pointsPerMm = POINTS_PER_MM): PointMm {
-  const local = { x: (point.xPt - screen.widthPt / 2) / pointsPerMm, y: (screen.heightPt / 2 - point.yPt) / pointsPerMm };
+  const scaleX = pose.screenSizeCm ? screen.widthPt / (pose.screenSizeCm.width * 10) : pointsPerMm;
+  const scaleY = pose.screenSizeCm ? screen.heightPt / (pose.screenSizeCm.height * 10) : pointsPerMm;
+  const local = { x: (point.xPt - screen.widthPt / 2) / scaleX, y: (screen.heightPt / 2 - point.yPt) / scaleY };
   const turned = rotate(local, pose.headingRad - Math.PI / 2);
   return { x: pose.centreMm.x + turned.x, y: pose.centreMm.y + turned.y };
 }

@@ -1,5 +1,5 @@
 import { Random } from './Random';
-import { generateArena, resolveArenaCollision } from './arena';
+import { generateArena, isBlocked, resolveArenaCollision } from './arena';
 import { BEHAVIOUR_SPECS, defaultTraits, inheritBattleTraits, inheritTraits, randomTraits } from './traits';
 import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, PowerId, SimulationEvent, SimulationState, TraitSet } from './types';
 
@@ -171,10 +171,19 @@ export function createBug(
 
 function spawnFood(state: SimulationState, rng: Random): Food {
   const margin = WALL_MARGIN * 2;
+  let x = state.habitat.width / 2;
+  let y = state.habitat.height / 2;
+  // Keep food out of water and solid arena geometry. A bounded search preserves
+  // deterministic RNG use and avoids hanging if a future arena is crowded.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    x = rng.range(margin, state.habitat.width - margin);
+    y = rng.range(margin, state.habitat.height - margin);
+    if (!isBlocked(state.arena, { x, y }, EAT_RADIUS)) break;
+  }
   const food: Food = {
     id: nextId(state, 'food'),
-    x: rng.range(margin, state.habitat.width - margin),
-    y: rng.range(margin, state.habitat.height - margin),
+    x,
+    y,
     spawnedAtS: state.timeS,
     expiresAtS: state.timeS + FOOD_LIFETIME_S,
   };
@@ -456,16 +465,7 @@ export function stepSimulation(state: SimulationState, { dt = STEP_S, canExit = 
   });
 
   state.stats.peakPopulation = Math.max(state.stats.peakPopulation, state.bugs.length);
-  const localAlive = state.bugs.some((bug) => bug.owner === 'local');
-  const remoteAlive = state.bugs.some((bug) => bug.owner === 'remote');
-  const wildAlive = state.bugs.some((bug) => bug.owner === 'wild');
-  if (state.mode === 'battle' && (!localAlive || (!remoteAlive && !wildAlive))) {
-    state.status = 'ended';
-    state.endedAtS = state.timeS;
-    const winner = localAlive ? 'local' : remoteAlive ? 'remote' : null;
-    state.battleWinner = winner;
-    events.push({ type: 'battle-ended', winner });
-  } else if (state.mode === 'ecosystem' && state.bugs.length < 2) {
+  if (state.mode === 'ecosystem' && state.bugs.length < 2) {
     state.status = 'ended'; state.endedAtS = state.timeS; events.push({ type: 'ecosystem-ended', survivors: state.bugs.length });
   }
   return events;

@@ -191,7 +191,7 @@ function EndedCard({ state, onRestart }: { state: SimulationState; onRestart: ()
     <View style={styles.endedBackdrop}>
       <View style={styles.endedCard}>
         <Text style={styles.eyebrow}>{state.mode === 'battle' ? 'BATTLE COMPLETE' : `ECOSYSTEM #${state.ecosystem} HAS ENDED`}</Text>
-        <Text style={styles.endedTitle}>{state.mode === 'battle' ? (state.battleWinner === 'local' ? 'YOU WIN' : state.battleWinner === 'remote' ? 'OPPONENT WINS' : 'DRAW') : survivor ? `Only ${survivor.name} is left` : 'No bugs are left'}</Text>
+        <Text style={styles.endedTitle}>{survivor ? `Only ${survivor.name} is left` : 'No bugs are left'}</Text>
         <Text style={styles.endedText}>
           {state.mode === 'battle' ? `The ${state.arena.biome} arena lasted ${formatClock(state.endedAtS ?? state.timeS)}.` : `A population needs at least two bugs. It lasted ${formatClock(state.endedAtS ?? state.timeS)}, reached generation ${state.stats.maxGeneration}.`}
         </Text>
@@ -208,7 +208,7 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
   const [linkOpen, setLinkOpen] = useState(false);
   const { state } = ecosystem;
   const joinOverlay = bridge.joinOpen && (
-    <JoinOverlay role={bridge.role} note={bridge.joinNote} status={bridge.joinStatus} onSwipe={bridge.handleSwipe} onClose={bridge.closeJoin} theme={JOIN_THEME} />
+    <JoinOverlay role={bridge.role} note={bridge.joinNote} status={bridge.joinStatus} onSwipe={bridge.handleSwipe} onClose={bridge.closeJoin} theme={JOIN_THEME} camera={bridge.camera} />
   );
 
   if (!ecosystem.loaded || !state) {

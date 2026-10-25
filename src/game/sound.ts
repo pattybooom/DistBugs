@@ -45,7 +45,7 @@ export function playEvents(events: SimulationEvent[], enabled: boolean, biome: B
     if (event.type === 'ate') void playSound('eat', enabled);
     else if (event.type === 'attacked') void playSound('hit', enabled);
     else if (event.type === 'power-used') void playSound('power', enabled);
-    else if (event.type === 'defeated' || event.type === 'battle-ended') void playSound('defeat', enabled);
+    else if (event.type === 'defeated') void playSound('defeat', enabled);
   }
   if (events.length === 0) void playSound('ambient', enabled);
   void biome;

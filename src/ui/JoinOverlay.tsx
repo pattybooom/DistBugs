@@ -1,6 +1,8 @@
 import { useRef } from 'react';
-import { GestureResponderEvent, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { GestureResponderEvent, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { PhoneRole, TouchSample } from '../spatial/Stitch';
+import { CameraJoinControls as CameraControls } from './useCameraJoin';
+import { CameraJoinControls } from './CameraJoinControls';
 
 export type JoinOverlayTheme = { background: string; accent: string; text: string; muted: string; warn: string; border: string };
 
@@ -17,6 +19,7 @@ export function JoinOverlay({
   onSwipe,
   onClose,
   theme = LAB_THEME,
+  camera,
 }: {
   role: PhoneRole | null;
   note: string | null;
@@ -24,6 +27,7 @@ export function JoinOverlay({
   onSwipe: (trail: TouchSample[], startedAt: number, endedAt: number) => void;
   onClose: () => void;
   theme?: JoinOverlayTheme;
+  camera?: CameraControls;
 }) {
   const trail = useRef<TouchSample[]>([]);
   const startedAt = useRef(0);
@@ -41,8 +45,8 @@ export function JoinOverlay({
   return (
     <View
       style={[styles.overlay, { backgroundColor: theme.background }]}
-      onStartShouldSetResponder={() => true}
-      onMoveShouldSetResponder={() => true}
+      onStartShouldSetResponder={() => !camera?.enabled}
+      onMoveShouldSetResponder={() => !camera?.enabled}
       onResponderTerminationRequest={() => false}
       onResponderGrant={(event) => {
         startedAt.current = Date.now();
@@ -55,16 +59,16 @@ export function JoinOverlay({
       }}
       onResponderTerminate={finish}
     >
-      <View pointerEvents="none" style={styles.copy}>
+      <ScrollView scrollEnabled={!!camera?.enabled} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.copy}>
         <Text style={[styles.eyebrow, { color: theme.accent }]}>{role ? `PHONE ${role}` : 'NOT CONNECTED'}</Text>
-        <Text style={[styles.title, { color: theme.text }]}>Swipe across{'\n'}both screens</Text>
-        <Text style={[styles.chevrons, { color: theme.accent }]}>›  ›  ›</Text>
+        <Text style={[styles.title, { color: theme.text }]}>{camera?.enabled ? 'Position both phones\nunder the camera' : 'Swipe across\nboth screens'}</Text>
+        {camera && <CameraJoinControls camera={camera} role={role} />}
         <Text style={[styles.hint, { color: theme.muted }]}>
-          Lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.
+          {camera?.enabled ? 'Keep both phone markers and all four reference markers visible. Hold still for one second to join automatically.' : 'Swipe fallback: lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.'}
         </Text>
         <Text style={[styles.status, { color: theme.text }]}>{status}</Text>
         {note && <Text style={[styles.note, { color: theme.warn }]}>{note}</Text>}
-      </View>
+      </ScrollView>
       <TouchableOpacity style={[styles.close, { borderColor: theme.border }]} onPress={onClose}>
         <Text style={[styles.closeText, { color: theme.text }]}>Not now</Text>
       </TouchableOpacity>
@@ -73,8 +77,8 @@ export function JoinOverlay({
 }
 
 const styles = StyleSheet.create({
-  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'center', paddingHorizontal: 32 },
-  copy: { gap: 14 },
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'center', paddingHorizontal: 32, paddingTop: 64, paddingBottom: 120 },
+  copy: { gap: 14, flexGrow: 1, justifyContent: 'center' },
   eyebrow: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5 },
   title: { fontSize: 38, fontWeight: '800', letterSpacing: -1 },
   chevrons: { fontSize: 34, fontWeight: '800' },
