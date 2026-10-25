@@ -3,7 +3,7 @@ import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } fr
 import { defaultStarterTraits } from '../game/Simulation';
 import { PALETTES } from '../game/sprites';
 import { adjustBehaviour, BEHAVIOUR_KEYS, BEHAVIOUR_SPECS, BehaviourKey, cycleVisual, VisualOptionKey } from '../game/traits';
-import { TraitSet } from '../game/types';
+import { PowerId, TraitSet } from '../game/types';
 import { BugSprite } from './BugSprite';
 import { COLORS, PIXEL_FONT } from './theme';
 
@@ -17,7 +17,7 @@ const VISUAL_ROWS: { key: VisualOptionKey | 'palette'; label: string }[] = [
 
 const BEHAVIOUR_HINTS: Record<BehaviourKey, string> = {
   speed: 'Reaches food first, but burns more energy',
-  aggression: 'Chases calmer bugs off, at a hunger cost',
+  aggression: 'Engages sooner, hits harder, but burns more energy and takes more risks',
   lifespanS: 'Seconds before it dies of old age',
   hungerRate: 'How fast it gets hungry',
   foodForReproduction: 'Meals needed to lay one offspring',
@@ -61,14 +61,14 @@ const visualValue = (traits: TraitSet, key: VisualOptionKey | 'palette') =>
 
 export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }: {
   ecosystemNumber: number;
-  onRelease: (starters: [TraitSet, TraitSet]) => void;
+  onRelease: (starters: [TraitSet], power: PowerId) => void;
   onRoll: () => [TraitSet, TraitSet];
   onOpenLab: () => void;
 }) {
-  const [starters, setStarters] = useState<[TraitSet, TraitSet]>(defaultStarterTraits);
-  const [selected, setSelected] = useState<0 | 1>(0);
-  const traits = starters[selected];
-  const update = (next: TraitSet) => setStarters((current) => (selected === 0 ? [next, current[1]] : [current[0], next]));
+  const [starter, setStarter] = useState<TraitSet>(defaultStarterTraits()[0]);
+  const [power, setPower] = useState<PowerId>('dash');
+  const traits = starter;
+  const update = (next: TraitSet) => setStarter(next);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -76,29 +76,24 @@ export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }:
         <View style={styles.header}>
           <View style={styles.headerText}>
             <Text style={styles.eyebrow}>ECOSYSTEM #{ecosystemNumber} · WORKSHOP</Text>
-            <Text style={styles.title}>Design two starters</Text>
-            <Text style={styles.subtitle}>Once released they look after themselves: they hunt for food, breed, age and die.</Text>
+            <Text style={styles.title}>Build your battle bug</Text>
+            <Text style={styles.subtitle}>Choose one starter and one signature power. Your bug fights autonomously inside a generated arena.</Text>
           </View>
           <TouchableOpacity onPress={onOpenLab} hitSlop={8}>
             <Text style={styles.labLink}>Spatial Lab</Text>
           </TouchableOpacity>
         </View>
 
-        <View style={styles.slots}>
-          {starters.map((starter, index) => (
-            <TouchableOpacity
-              key={index}
-              style={[styles.slot, selected === index && styles.slotSelected]}
-              onPress={() => setSelected(index as 0 | 1)}
-            >
-              <BugSprite visual={starter.visual} pixel={4} />
-              <Text style={[styles.slotLabel, selected === index && styles.slotLabelSelected]}>STARTER {index + 1}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
+        <View style={styles.slots}><View style={[styles.slot, styles.slotSelected]}><BugSprite visual={traits.visual} pixel={4} /><Text style={[styles.slotLabel, styles.slotLabelSelected]}>YOUR BUG</Text></View></View>
 
         <View style={styles.preview}>
           <BugSprite visual={traits.visual} pixel={9} />
+        </View>
+
+        <View style={styles.panel}>
+          <Text style={styles.sectionLabel}>SIGNATURE POWER</Text>
+          {(['dash', 'shield', 'stun-pulse', 'regeneration', 'frenzy'] as PowerId[]).map((id) => <TouchableOpacity key={id} style={[styles.power, power === id && styles.powerSelected]} onPress={() => setPower(id)}><Text style={styles.powerText}>{id.replace('-', ' ').toUpperCase()}</Text></TouchableOpacity>)}
+          <Text style={styles.hint}>Aggression: higher values engage sooner, hit harder, and resist retreating; they also increase energy use and risk.</Text>
         </View>
 
         <View style={styles.panel}>
@@ -137,11 +132,11 @@ export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }:
         </View>
 
         <View style={styles.actions}>
-          <TouchableOpacity style={styles.secondary} onPress={() => setStarters(onRoll())}>
+          <TouchableOpacity style={styles.secondary} onPress={() => setStarter(onRoll()[0])}>
             <Text style={styles.secondaryText}>Randomise</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.primary} onPress={() => onRelease(starters)}>
-            <Text style={styles.primaryText}>Release into habitat</Text>
+          <TouchableOpacity style={styles.primary} onPress={() => onRelease([starter], power)}>
+            <Text style={styles.primaryText}>Start battle</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -181,4 +176,7 @@ const styles = StyleSheet.create({
   primaryText: { color: '#241b12', fontWeight: '900' },
   secondary: { paddingHorizontal: 18, paddingVertical: 16, borderRadius: 14, borderWidth: 1, borderColor: COLORS.panelBorder, alignItems: 'center' },
   secondaryText: { color: COLORS.text, fontWeight: '700' },
+  power: { padding: 10, borderRadius: 10, backgroundColor: COLORS.soil },
+  powerSelected: { borderWidth: 2, borderColor: COLORS.accent },
+  powerText: { color: COLORS.text, fontWeight: '800', fontSize: 12 },
 });

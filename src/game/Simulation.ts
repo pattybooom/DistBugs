@@ -1,6 +1,7 @@
 import { Random } from './Random';
-import { BEHAVIOUR_SPECS, defaultTraits, inheritTraits, randomTraits } from './traits';
-import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, SimulationEvent, SimulationState, TraitSet } from './types';
+import { generateArena, resolveArenaCollision } from './arena';
+import { BEHAVIOUR_SPECS, defaultTraits, inheritBattleTraits, inheritTraits, randomTraits } from './traits';
+import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, PowerId, SimulationEvent, SimulationState, TraitSet } from './types';
 
 /** Fixed timestep: the simulation always advances in steps of this length, whatever the frame rate. */
 export const STEP_S = 0.05;
@@ -14,10 +15,10 @@ export const OFFSPRING_SATIETY = 60;
 export const FOOD_SATIETY = 30;
 
 /** Mean seconds between food spawns in a default-sized habitat; each interval is jittered ±50%. */
-export const FOOD_SPAWN_INTERVAL_S = 1.8;
+export const FOOD_SPAWN_INTERVAL_S = 0.55;
 export const FOOD_LIFETIME_S = 20;
 /** Most food at once in a default-sized habitat. Larger habitats get more, at the same density. */
-export const MAX_FOOD = 14;
+export const MAX_FOOD = 28;
 export const STARTER_FOOD = 3;
 
 /** How far a bug notices food. */
@@ -30,11 +31,15 @@ export const AGGRESSION_MARGIN = 0.15;
 export const BULLY_SATIETY = 85;
 export const FLEE_S = 1.2;
 export const FLEE_SPEED_FACTOR = 1.35;
+export const ATTACK_RANGE = 18;
+export const ATTACK_COOLDOWN_S = 0.8;
+export const BASE_HEALTH = 100;
 const WANDER_JITTER = 4;
 const WANDER_TURN_LIMIT = 1.5;
 const WALL_MARGIN = 6;
 
 export const MAX_POPULATION = 40;
+export const STARTING_BATTLE_BUGS = 10;
 /** Bugs breed only after this share of their lifespan. */
 export const MATURITY_FRACTION = 0.15;
 export const BREEDING_MIN_SATIETY = 35;
@@ -105,6 +110,11 @@ export function createSimulation(seed: number, habitat: Habitat = DEFAULT_HABITA
     bugs: [],
     food: [],
     foodTimerS: foodSpawnIntervalS(habitat),
+    mode: 'battle',
+    arena: generateArena(seed, habitat),
+    battleWinner: null,
+    speedMultiplier: 1.65,
+    soundEnabled: true,
     stats: emptyStats(),
   };
 }
@@ -148,6 +158,14 @@ export function createBug(
     targetFoodId: null,
     fleeS: 0,
     wanderTurn: 0,
+    health: BASE_HEALTH,
+    maxHealth: BASE_HEALTH,
+    attackCooldownS: 0,
+    stunS: 0,
+    shieldS: 0,
+    powerCooldownS: 0,
+    power: null,
+    owner: parent?.owner ?? 'wild',
   };
 }
 
@@ -165,19 +183,32 @@ function spawnFood(state: SimulationState, rng: Random): Food {
 }
 
 /** Puts the two starters into the habitat and starts the clock. */
-export function releaseStarters(state: SimulationState, starters: [TraitSet, TraitSet]): void {
+export function releaseStarters(state: SimulationState, starters: [TraitSet, TraitSet] | [TraitSet], power: PowerId = 'dash'): void {
   if (state.status !== 'workshop') throw new Error(`Cannot release starters while the ecosystem is ${state.status}`);
   const { width, height } = state.habitat;
+  // A local launch is a peaceful ecosystem. Battle mode is activated when a remote
+  // opponent is admitted by the phone bridge, so one device never ends immediately.
+  state.mode = 'ecosystem';
   withRandom(state, (rng) => {
-    state.bugs = [
-      createBug(state, rng, starters[0], { x: width * 0.35, y: height * 0.5 }),
-      createBug(state, rng, starters[1], { x: width * 0.65, y: height * 0.5 }),
-    ];
+    const local = createBug(state, rng, starters[0], state.arena.spawnPoints[0]);
+    local.owner = 'local'; local.power = power;
+    state.bugs = [local];
+    if (starters[1]) { const remote = createBug(state, rng, starters[1], state.arena.spawnPoints[1]); remote.owner = 'remote'; remote.power = power; state.bugs.push(remote); }
+    if (starters.length === 1) {
+      for (let index = 1; index < STARTING_BATTLE_BUGS; index += 1) {
+        const ai = createBug(state, rng, { visual: { ...starters[0].visual }, behaviour: { ...starters[0].behaviour } }, {
+          x: rng.range(WALL_MARGIN * 2, width - WALL_MARGIN * 2),
+          y: rng.range(WALL_MARGIN * 2, height - WALL_MARGIN * 2),
+        });
+        ai.owner = 'wild';
+        state.bugs.push(ai);
+      }
+    }
     for (let i = 0; i < STARTER_FOOD; i += 1) spawnFood(state, rng);
   });
   state.status = 'running';
   state.paused = false;
-  state.stats = { ...emptyStats(), peakPopulation: 2, maxGeneration: 1 };
+  state.stats = { ...emptyStats(), peakPopulation: state.bugs.length, maxGeneration: 1 };
 }
 
 /** Clears an ended (or abandoned) ecosystem and returns to the workshop. The generator carries on. */
@@ -236,6 +267,40 @@ function threatTo(state: SimulationState, bug: Bug): Bug | null {
   return threat;
 }
 
+function enemyTarget(state: SimulationState, bug: Bug): Bug | null {
+  let target: Bug | null = null; let best = Infinity;
+  for (const other of state.bugs) {
+    if (other === bug || other.owner === bug.owner || other.health <= 0) continue;
+    const d = distance(bug, other);
+    if (d < best) { best = d; target = other; }
+  }
+  return target;
+}
+
+const powerCooldown = (power: PowerId) => power === 'dash' ? 5 : power === 'shield' ? 8 : power === 'regeneration' ? 10 : power === 'frenzy' ? 9 : 7;
+
+function usePower(state: SimulationState, bug: Bug, target: Bug | null, events: SimulationEvent[]) {
+  if (!bug.power || bug.powerCooldownS > 0) return;
+  const power = bug.power;
+  if (power === 'dash' && target) { bug.x += Math.cos(bug.heading) * 28; bug.y += Math.sin(bug.heading) * 28; }
+  if (power === 'shield') bug.shieldS = 2.5;
+  if (power === 'regeneration') bug.health = Math.min(bug.maxHealth, bug.health + 28);
+  if (power === 'frenzy') bug.attackCooldownS = 0;
+  if (power === 'stun-pulse' && target && distance(bug, target) < 55) target.stunS = 1.4;
+  bug.powerCooldownS = powerCooldown(power);
+  events.push({ type: 'power-used', bugId: bug.id, power });
+}
+
+function attack(state: SimulationState, bug: Bug, target: Bug, events: SimulationEvent[]) {
+  if (bug.attackCooldownS > 0 || distance(bug, target) > ATTACK_RANGE) return;
+  const damage = 8 + Math.round(bug.traits.behaviour.aggression * 12);
+  const actual = target.shieldS > 0 ? Math.round(damage * 0.25) : damage;
+  target.health = Math.max(0, target.health - actual);
+  bug.attackCooldownS = Math.max(0.25, ATTACK_COOLDOWN_S - bug.traits.behaviour.aggression * 0.35);
+  events.push({ type: 'attacked', attackerId: bug.id, targetId: target.id, damage: actual });
+  if (target.health === 0) events.push({ type: 'defeated', bugId: target.id, name: target.name, killerId: bug.id });
+}
+
 /** The wall a bug has walked through this step, and where it crossed, if any. */
 function wallCrossed(state: SimulationState, bug: Bug): { edge: HabitatEdge; point: { x: number; y: number } } | null {
   const { width, height } = state.habitat;
@@ -263,9 +328,11 @@ function keepInside(state: SimulationState, bug: Bug) {
 
 /** Moves a bug one step. Returns where it left the habitat if it walked out through an open edge. */
 function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number, canExit: ExitCheck | null) {
-  let speed = bug.traits.behaviour.speed;
+  let speed = bug.traits.behaviour.speed * (state.mode === 'battle' ? state.speedMultiplier : 1);
+  const target = state.mode === 'battle' ? enemyTarget(state, bug) : null;
+  if (target) bug.heading = Math.atan2(target.y - bug.y, target.x - bug.x);
   const threat = threatTo(state, bug);
-  if (threat) {
+  if (threat && bug.traits.behaviour.aggression < threat.traits.behaviour.aggression) {
     bug.fleeS = FLEE_S;
     bug.targetFoodId = null;
     bug.heading = Math.atan2(bug.y - threat.y, bug.x - threat.x);
@@ -274,7 +341,7 @@ function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number, canE
     bug.fleeS = Math.max(0, bug.fleeS - dt);
     speed *= FLEE_SPEED_FACTOR;
   } else {
-    const food = nearestFood(state, bug);
+    const food = target ? null : nearestFood(state, bug);
     bug.targetFoodId = food?.id ?? null;
     if (food) {
       bug.heading = Math.atan2(food.y - bug.y, food.x - bug.x);
@@ -285,8 +352,10 @@ function moveBug(state: SimulationState, bug: Bug, rng: Random, dt: number, canE
       bug.heading += bug.wanderTurn * dt;
     }
   }
+  const previous = { x: bug.x, y: bug.y };
   bug.x += Math.cos(bug.heading) * speed * dt;
   bug.y += Math.sin(bug.heading) * speed * dt;
+  resolveArenaCollision(state.arena, bug, previous);
   const crossed = canExit ? wallCrossed(state, bug) : null;
   if (crossed && canExit?.(crossed.point, crossed.edge)) return crossed;
   keepInside(state, bug);
@@ -310,7 +379,7 @@ export const canBreed = (bug: Bug) =>
   isMature(bug) && bug.foodEaten >= bug.traits.behaviour.foodForReproduction && bug.satiety >= BREEDING_MIN_SATIETY;
 
 function breed(state: SimulationState, parent: Bug, rng: Random, events: SimulationEvent[]) {
-  const { traits, visualMutation } = inheritTraits(parent.traits, rng);
+  const { traits, visualMutation } = state.mode === 'battle' ? inheritBattleTraits(parent.traits) : inheritTraits(parent.traits, rng);
   const angle = rng.range(-Math.PI, Math.PI);
   const { width, height } = state.habitat;
   const at = {
@@ -327,8 +396,7 @@ function breed(state: SimulationState, parent: Bug, rng: Random, events: Simulat
   events.push({ type: 'born', bugId: child.id, name: child.name, parentId: parent.id, generation: child.generation, visualMutation });
 }
 
-const deathCause = (bug: Bug): DeathCause | null =>
-  bug.ageS >= bug.traits.behaviour.lifespanS ? 'old-age' : bug.satiety <= 0 ? 'starvation' : null;
+const deathCause = (bug: Bug): DeathCause | null => bug.health <= 0 ? 'combat' : bug.ageS >= bug.traits.behaviour.lifespanS ? 'old-age' : bug.satiety <= 0 ? 'starvation' : null;
 
 /**
  * Advances the ecosystem by one fixed step, in place, and returns what happened. Does nothing
@@ -353,6 +421,11 @@ export function stepSimulation(state: SimulationState, { dt = STEP_S, canExit = 
 
     state.bugs = state.bugs.filter((bug) => {
       bug.ageS += dt;
+      bug.attackCooldownS = Math.max(0, bug.attackCooldownS - dt);
+      bug.powerCooldownS = Math.max(0, bug.powerCooldownS - dt);
+      bug.stunS = Math.max(0, bug.stunS - dt);
+      bug.shieldS = Math.max(0, bug.shieldS - dt);
+      if (bug.power === 'regeneration' && bug.health > 0) bug.health = Math.min(bug.maxHealth, bug.health + dt * 0.5);
       bug.satiety = Math.max(0, bug.satiety - hungerDrain(bug.traits) * dt);
       const cause = deathCause(bug);
       if (!cause) return true;
@@ -363,6 +436,10 @@ export function stepSimulation(state: SimulationState, { dt = STEP_S, canExit = 
     });
 
     for (const bug of [...state.bugs]) {
+      const target = state.mode === 'battle' ? enemyTarget(state, bug) : null;
+      if (state.mode === 'battle') usePower(state, bug, target, events);
+      if (state.mode === 'battle' && target) attack(state, bug, target, events);
+      if (bug.stunS > 0) continue;
       const exitsOpen = canExit && state.bugs.length > MIN_HOME_POPULATION ? canExit : null;
       const departed = moveBug(state, bug, rng, dt, exitsOpen);
       if (departed) {
@@ -379,10 +456,17 @@ export function stepSimulation(state: SimulationState, { dt = STEP_S, canExit = 
   });
 
   state.stats.peakPopulation = Math.max(state.stats.peakPopulation, state.bugs.length);
-  if (state.bugs.length < 2) {
+  const localAlive = state.bugs.some((bug) => bug.owner === 'local');
+  const remoteAlive = state.bugs.some((bug) => bug.owner === 'remote');
+  const wildAlive = state.bugs.some((bug) => bug.owner === 'wild');
+  if (state.mode === 'battle' && (!localAlive || (!remoteAlive && !wildAlive))) {
     state.status = 'ended';
     state.endedAtS = state.timeS;
-    events.push({ type: 'ecosystem-ended', survivors: state.bugs.length });
+    const winner = localAlive ? 'local' : remoteAlive ? 'remote' : null;
+    state.battleWinner = winner;
+    events.push({ type: 'battle-ended', winner });
+  } else if (state.mode === 'ecosystem' && state.bugs.length < 2) {
+    state.status = 'ended'; state.endedAtS = state.timeS; events.push({ type: 'ecosystem-ended', survivors: state.bugs.length });
   }
   return events;
 }
@@ -405,6 +489,8 @@ export function admitBug(state: SimulationState, bug: Bug, at: { x: number; y: n
     targetFoodId: null,
     fleeS: 0,
   };
+  state.mode = 'battle';
+  admitted.owner = 'remote';
   state.bugs.push(admitted);
   state.stats.peakPopulation = Math.max(state.stats.peakPopulation, state.bugs.length);
   state.stats.maxGeneration = Math.max(state.stats.maxGeneration, admitted.generation);

@@ -1,9 +1,10 @@
 import { PALETTES } from './sprites';
 import { BEHAVIOUR_KEYS } from './traits';
+import { generateArena } from './arena';
 import { BODY_SHAPES, Bug, EYE_STYLES, FEATURES, Food, HORN_STYLES, SimulationState, TraitSet } from './types';
 
 export const STORAGE_KEY = 'distbugs.ecosystem';
-export const SAVE_VERSION = 1;
+export const SAVE_VERSION = 2;
 
 /** The part of AsyncStorage this module uses, so tests can pass an in-memory store. */
 export type KeyValueStore = {
@@ -52,8 +53,18 @@ export function deserializeSimulation(json: string | null): SimulationState | nu
   } catch {
     return null;
   }
-  if (!isObject(file) || file.version !== SAVE_VERSION || !isObject(file.state)) return null;
+  if (!isObject(file) || ![1, SAVE_VERSION].includes(file.version as number) || !isObject(file.state)) return null;
   const state = file.state;
+  if (file.version === 1) {
+    state.mode = 'ecosystem';
+    state.arena = generateArena(isNumber(state.seed) ? state.seed : 1, state.habitat as SimulationState['habitat']);
+    state.battleWinner = null;
+    state.speedMultiplier = 1;
+    state.soundEnabled = true;
+    if (Array.isArray(state.bugs)) for (const bug of state.bugs) {
+      bug.health = 100; bug.maxHealth = 100; bug.attackCooldownS = 0; bug.stunS = 0; bug.shieldS = 0; bug.powerCooldownS = 0; bug.power = null; bug.owner = 'wild';
+    }
+  }
   const valid = oneOf(['workshop', 'running', 'ended'], state.status)
     && typeof state.paused === 'boolean'
     && ['seed', 'rngState', 'ecosystem', 'timeS', 'nextId', 'foodTimerS'].every((key) => isNumber(state[key]))

@@ -15,7 +15,7 @@ import { BugBridge } from './useBugBridge';
 import { Ecosystem } from './useEcosystem';
 
 /** Screen points per sprite pixel; the habitat is scaled, bugs are not, so they stay crisp. */
-const BUG_PIXEL = 2;
+const BUG_PIXEL = 3;
 const BUG_WIDTH = SPRITE_WIDTH * BUG_PIXEL;
 const BUG_HEIGHT = SPRITE_HEIGHT * BUG_PIXEL;
 const SELECT_SIZE = 36;
@@ -85,6 +85,7 @@ function BugView({ bug, scale, selected }: { bug: Bug; scale: number; selected: 
           <View style={[styles.hungerFill, { width: Math.max(2, Math.round((bug.satiety / HUNGRY_SATIETY) * 16)) }]} />
         </View>
       )}
+      <View style={[styles.healthTrack, { left: x - 12, top: y - BUG_HEIGHT / 2 - 11 }]}><View style={[styles.healthFill, { width: Math.max(1, Math.round((bug.health / bug.maxHealth) * 24)), backgroundColor: bug.owner === 'local' ? COLORS.good : COLORS.bad }]} /></View>
     </>
   );
 }
@@ -106,6 +107,7 @@ function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
   onFieldLayout: (layout: HabitatLayout) => void;
 }) {
   const [frame, setFrame] = useState<Size | null>(null);
+  const [zoom, setZoom] = useState(1);
   const frameRef = useRef<HostInstance>(null);
   const { habitat } = state;
   const pebbles = useMemo(() => makePebbles(state.seed + state.ecosystem, habitat), [state.seed, state.ecosystem, habitat]);
@@ -132,8 +134,10 @@ function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
 
   const handlePress = (locationX: number, locationY: number) => {
     if (!scale) return;
-    const x = (locationX - offset.x) / scale;
-    const y = (locationY - offset.y) / scale;
+    const centerX = habitat.width / 2;
+    const centerY = habitat.height / 2;
+    const x = ((locationX - offset.x) / scale - centerX) / zoom + centerX;
+    const y = ((locationY - offset.y) / scale - centerY) / zoom + centerY;
     let nearest: Bug | null = null;
     let nearestDistance = TAP_RADIUS_PT / scale;
     for (const bug of state.bugs) {
@@ -149,16 +153,24 @@ function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
   return (
     <Pressable ref={frameRef} style={styles.habitatFrame} onLayout={handleLayout} onPress={(event) => handlePress(event.nativeEvent.locationX, event.nativeEvent.locationY)}>
       {/* Children ignore touches so the tap position is always measured against the frame. */}
-      <View pointerEvents="none" style={[styles.field, { left: offset.x, top: offset.y, ...field }]}>
+      <View pointerEvents="none" style={[styles.field, { left: offset.x, top: offset.y, ...field, transform: [{ scale: zoom }] }]}>
         {pebbles.map((pebble, index) => (
           <View
             key={index}
             style={[styles.pebble, { left: Math.round(pebble.x * scale), top: Math.round(pebble.y * scale), width: pebble.size, height: pebble.size }]}
           />
         ))}
+        {state.arena.water.map((item, index) => <View key={`water-${index}`} style={[styles.water, { left: (item.x - item.radius) * scale, top: (item.y - item.radius) * scale, width: item.radius * 2 * scale, height: item.radius * 2 * scale, borderRadius: item.radius * scale }]} />)}
+        {state.arena.hazards.map((item, index) => <View key={`hazard-${index}`} style={[styles.hazard, { left: (item.x - item.radius) * scale, top: (item.y - item.radius) * scale, width: item.radius * 2 * scale, height: item.radius * 2 * scale, borderRadius: item.radius * scale }]} />)}
+        {state.arena.structures.map((item, index) => <View key={`structure-${index}`} style={[styles.structure, { left: item.x * scale, top: item.y * scale, width: item.width * scale, height: item.height * scale }]} />)}
         {gates.map((gate, index) => <GateView key={index} gate={gate} field={field} scale={scale} />)}
         {state.food.map((food) => <FoodSprite key={food.id} food={food} timeS={state.timeS} scale={scale} />)}
         {state.bugs.map((bug) => <BugView key={bug.id} bug={bug} scale={scale} selected={bug.id === selectedId} />)}
+      </View>
+      <View style={styles.zoomControls}>
+        <TouchableOpacity style={styles.zoomButton} onPress={() => setZoom((value) => Math.min(2, Math.round((value + 0.25) * 100) / 100))}><Text style={styles.zoomText}>+</Text></TouchableOpacity>
+        <Text style={styles.zoomLabel}>{Math.round(zoom * 100)}%</Text>
+        <TouchableOpacity style={styles.zoomButton} onPress={() => setZoom((value) => Math.max(1, Math.round((value - 0.25) * 100) / 100))}><Text style={styles.zoomText}>−</Text></TouchableOpacity>
       </View>
     </Pressable>
   );
@@ -178,11 +190,10 @@ function EndedCard({ state, onRestart }: { state: SimulationState; onRestart: ()
   return (
     <View style={styles.endedBackdrop}>
       <View style={styles.endedCard}>
-        <Text style={styles.eyebrow}>ECOSYSTEM #{state.ecosystem} HAS ENDED</Text>
-        <Text style={styles.endedTitle}>{survivor ? `Only ${survivor.name} is left` : 'No bugs are left'}</Text>
+        <Text style={styles.eyebrow}>{state.mode === 'battle' ? 'BATTLE COMPLETE' : `ECOSYSTEM #${state.ecosystem} HAS ENDED`}</Text>
+        <Text style={styles.endedTitle}>{state.mode === 'battle' ? (state.battleWinner === 'local' ? 'YOU WIN' : state.battleWinner === 'remote' ? 'OPPONENT WINS' : 'DRAW') : survivor ? `Only ${survivor.name} is left` : 'No bugs are left'}</Text>
         <Text style={styles.endedText}>
-          A population needs at least two bugs. It lasted {formatClock(state.endedAtS ?? state.timeS)}, reached generation {state.stats.maxGeneration},
-          {' '}hatched {state.stats.births} and peaked at {state.stats.peakPopulation} bugs.
+          {state.mode === 'battle' ? `The ${state.arena.biome} arena lasted ${formatClock(state.endedAtS ?? state.timeS)}.` : `A population needs at least two bugs. It lasted ${formatClock(state.endedAtS ?? state.timeS)}, reached generation ${state.stats.maxGeneration}.`}
         </Text>
         <TouchableOpacity style={styles.primary} onPress={onRestart}>
           <Text style={styles.primaryText}>Start a new ecosystem</Text>
@@ -213,9 +224,9 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
       <View style={styles.root}>
         <TraitWorkshop
           ecosystemNumber={state.ecosystem}
-          onRelease={(starters) => {
+          onRelease={(starters, power) => {
             setSelectedId(null);
-            ecosystem.release(starters);
+            ecosystem.release(starters, power);
           }}
           onRoll={ecosystem.rollStarters}
           onOpenLab={onOpenLab}
@@ -249,7 +260,7 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
             <View style={styles.header}>
               <View>
                 <Text style={styles.eyebrow}>ECOSYSTEM #{state.ecosystem}</Text>
-                <Text style={styles.title}>DistBugs</Text>
+                <Text style={styles.title}>DistBugs · {state.arena.biome}</Text>
               </View>
               <View style={styles.headerLinks}>
                 <TouchableOpacity onPress={() => { setSelectedId(null); setLinkOpen(true); }} hitSlop={8}>
@@ -260,6 +271,9 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
                 <TouchableOpacity onPress={onOpenLab} hitSlop={8}>
                   <Text style={styles.labLink}>Spatial Lab</Text>
                 </TouchableOpacity>
+                <TouchableOpacity onPress={ecosystem.toggleSound} hitSlop={8}>
+                  <Text style={styles.labLink}>{state.soundEnabled ? 'Sound on' : 'Muted'}</Text>
+                </TouchableOpacity>
               </View>
             </View>
             <View style={styles.stats}>
@@ -269,6 +283,7 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
               <Stat label="BORN" value={state.stats.births} />
               <Stat label="DIED" value={deaths} />
               <Stat label="TIME" value={formatClock(state.timeS)} />
+              {state.mode === 'battle' && <Stat label="POWER" value={state.bugs.find((bug) => bug.owner === 'local')?.power ?? '—'} />}
             </View>
           </View>
 
@@ -344,6 +359,15 @@ const styles = StyleSheet.create({
   selection: { position: 'absolute', width: SELECT_SIZE, height: SELECT_SIZE, borderWidth: 2, borderColor: COLORS.select, borderStyle: 'dashed' },
   hungerTrack: { position: 'absolute', width: 16, height: 3, backgroundColor: 'rgba(0, 0, 0, 0.5)' },
   hungerFill: { height: 3, backgroundColor: COLORS.bad },
+  healthTrack: { position: 'absolute', width: 24, height: 3, backgroundColor: 'rgba(0, 0, 0, 0.6)' },
+  healthFill: { height: 3 },
+  water: { position: 'absolute', backgroundColor: 'rgba(55, 150, 190, 0.65)', borderWidth: 2, borderColor: 'rgba(150, 220, 230, 0.7)' },
+  hazard: { position: 'absolute', backgroundColor: 'rgba(215, 78, 60, 0.55)', borderWidth: 2, borderColor: COLORS.bad },
+  structure: { position: 'absolute', backgroundColor: 'rgba(72, 55, 42, 0.9)', borderWidth: 2, borderColor: 'rgba(180, 145, 95, 0.8)' },
+  zoomControls: { position: 'absolute', right: 12, bottom: 110, alignItems: 'center', gap: 4 },
+  zoomButton: { width: 38, height: 38, borderRadius: 12, backgroundColor: 'rgba(15, 13, 11, 0.78)', borderWidth: 1, borderColor: COLORS.panelBorder, alignItems: 'center', justifyContent: 'center' },
+  zoomText: { color: COLORS.text, fontSize: 24, fontWeight: '800', lineHeight: 26 },
+  zoomLabel: { color: COLORS.text, fontSize: 10, fontWeight: '900', backgroundColor: 'rgba(15, 13, 11, 0.7)', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4 },
   pausedTag: { alignSelf: 'flex-start', backgroundColor: 'rgba(15, 13, 11, 0.85)', paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: COLORS.accent },
   pausedText: { color: COLORS.accent, fontSize: 11, fontWeight: '900', letterSpacing: 1.5, fontFamily: PIXEL_FONT },
   endedBackdrop: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(15, 13, 11, 0.55)', justifyContent: 'center', padding: 24 },

@@ -16,7 +16,8 @@ import {
   rollStarterTraits,
 } from '../game/Simulation';
 import { SimulationDriver } from '../game/SimulationDriver';
-import { Bug, DeathCause, SimulationEvent, SimulationState, TraitSet } from '../game/types';
+import { playEvents } from '../game/sound';
+import { Bug, DeathCause, PowerId, SimulationEvent, SimulationState, TraitSet } from '../game/types';
 
 /** About 30 redraws a second; the simulation itself steps at its own fixed rate. */
 const RENDER_INTERVAL_MS = 33;
@@ -34,9 +35,10 @@ export type Ecosystem = {
   running: boolean;
   log: LogEntry[];
   obituaries: Record<string, Obituary>;
-  release: (starters: [TraitSet, TraitSet]) => void;
+  release: (starters: [TraitSet], power: PowerId) => void;
   restart: () => void;
   setPaused: (paused: boolean) => void;
+  toggleSound: () => void;
   rollStarters: () => [TraitSet, TraitSet];
   /** Opens walls onto the other phone and hands over bugs that walk through them; nulls close them. */
   setCrossing: (canExit: ExitCheck | null, onDeparted: ((event: DepartedEvent) => void) | null) => void;
@@ -84,8 +86,11 @@ export function useEcosystem(visible: boolean): Ecosystem {
         onDeparted.current?.(event);
       } else if (event.type === 'ecosystem-ended') {
         entries.push({ text: event.survivors === 1 ? 'One bug left: the ecosystem has ended' : 'No bugs left: the ecosystem has ended', tone: 'info' });
+      } else if (event.type === 'battle-ended') {
+        entries.push({ text: event.winner ? `${event.winner === 'local' ? 'You win' : 'Opponent wins'} · battle ended` : 'Draw · battle ended', tone: event.winner === 'local' ? 'birth' : 'death' });
       }
     }
+    if (driverRef.current?.state) playEvents(events, driverRef.current.state.soundEnabled, driverRef.current.state.arena.biome);
     addLog(entries);
   }, [addLog]);
 
@@ -193,8 +198,8 @@ export function useEcosystem(visible: boolean): Ecosystem {
     running: driverRef.current?.running ?? false,
     log,
     obituaries: obituaries.current,
-    release: (starters) => withDriver((driver) => {
-      releaseStarters(driver.state, starters);
+    release: (starters, power) => withDriver((driver) => {
+      releaseStarters(driver.state, starters, power);
       driver.saveNow();
       obituaries.current = {};
       setLog([]);
@@ -207,6 +212,7 @@ export function useEcosystem(visible: boolean): Ecosystem {
       setLog([]);
     }),
     setPaused: (paused) => withDriver((driver) => driver.setPaused(paused)),
+    toggleSound: () => withDriver((driver) => { driver.state.soundEnabled = !driver.state.soundEnabled; driver.saveNow(); }),
     rollStarters: () => driverRef.current ? rollStarterTraits(driverRef.current.state) : defaultStarterTraits(),
     setCrossing,
     admit,

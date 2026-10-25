@@ -39,7 +39,13 @@ export type Habitat = { width: number; height: number };
 
 export type Food = { id: string; x: number; y: number; spawnedAtS: number; expiresAtS: number };
 
-export type DeathCause = 'old-age' | 'starvation';
+export type Biome = 'meadow' | 'swamp' | 'desert' | 'tidepool';
+export type ArenaCircle = { x: number; y: number; radius: number; kind: 'water' | 'hazard' | 'cover' };
+export type ArenaRect = { x: number; y: number; width: number; height: number; kind: 'rock' | 'ruin' | 'tree' };
+export type Arena = { biome: Biome; water: ArenaCircle[]; hazards: ArenaCircle[]; cover: ArenaCircle[]; structures: ArenaRect[]; spawnPoints: { x: number; y: number }[] };
+export type PowerId = 'dash' | 'shield' | 'stun-pulse' | 'regeneration' | 'frenzy';
+
+export type DeathCause = 'old-age' | 'starvation' | 'combat';
 
 export type HabitatEdge = 'left' | 'right' | 'top' | 'bottom';
 
@@ -70,6 +76,14 @@ export type Bug = {
   fleeS: number;
   /** Current wandering turn rate, radians per second. */
   wanderTurn: number;
+  health: number;
+  maxHealth: number;
+  attackCooldownS: number;
+  stunS: number;
+  shieldS: number;
+  powerCooldownS: number;
+  power: PowerId | null;
+  owner: 'local' | 'remote' | 'wild';
 };
 
 /** `workshop`: building two starters. `running`: live (or paused). `ended`: fewer than two bugs left. */
@@ -98,6 +112,11 @@ export type SimulationState = {
   food: Food[];
   /** Seconds until the next food spawns. */
   foodTimerS: number;
+  mode: 'battle' | 'ecosystem';
+  arena: Arena;
+  battleWinner: 'local' | 'remote' | null;
+  speedMultiplier: number;
+  soundEnabled: boolean;
   stats: EcosystemStats;
 };
 
@@ -108,5 +127,9 @@ export type SimulationEvent =
   | { type: 'born'; bugId: string; name: string; parentId: string; generation: number; visualMutation: boolean }
   | { type: 'died'; bugId: string; name: string; cause: DeathCause; ageS: number }
   | { type: 'ecosystem-ended'; survivors: number }
+  | { type: 'attacked'; attackerId: string; targetId: string; damage: number }
+  | { type: 'power-used'; bugId: string; power: PowerId }
+  | { type: 'defeated'; bugId: string; name: string; killerId: string | null }
+  | { type: 'battle-ended'; winner: 'local' | 'remote' | null }
   /** The bug walked out through an open edge and is no longer in this ecosystem. */
   | { type: 'departed'; bug: Bug; edge: HabitatEdge; x: number; y: number };

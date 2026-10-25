@@ -1,6 +1,16 @@
 # DistBugs
 
-An autonomous bug ecosystem for one phone. The player designs two starter bugs in the trait workshop and releases them into a habitat. From then on the bugs look after themselves: they search for food, eat, breed, age and die. Each phone keeps its own ecosystem; phones do not share anything.
+DistBugs is a two-phone last-bug-standing battle game. Each player builds one starter bug, chooses a signature power, and releases it into the same seeded arena. Bugs navigate and choose targets autonomously; aggression drives combat rather than only intimidation.
+
+## Battle mode
+
+- **One starter.** Each player starts with one larger bug. There are no inherited stat or visual mutations; any offspring copy their parent's build exactly.
+- **Aggression.** Higher aggression makes a bug choose enemies sooner, deal more damage, attack on a shorter cooldown, and resist retreating. It also increases hunger drain and risk. The old rule—fleeing from a clearly more aggressive hungry bug—is retained as a low-health threat response, but aggression now has direct combat consequences.
+- **Powers.** Choose one signature power: dash, shield, stun pulse, regeneration, or frenzy. Powers have deterministic cooldowns and visible effects in the battle HUD and event log.
+- **Arena generation.** Every ecosystem has a saved seed, biome, water, hazards, cover, structures, and spawn points. The same seed generates the same arena on both phones. Water and structures block movement; food is spawned more frequently to keep fights moving.
+- **Victory.** A battle ends when either the local or remote bug is defeated. The result is persisted and shown as a win, loss, or draw.
+
+The original autonomous two-starter ecosystem remains available to legacy saves and tests as a compatibility mode, but new releases use battle mode.
 
 ## Ecosystem
 
