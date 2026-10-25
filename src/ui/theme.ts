@@ -6,7 +6,6 @@ export const COLORS = {
   panelBorder: '#2f2820',
   soil: '#2a2119',
   soilEdge: '#4a3a2a',
-  pebble: '#3a2e23',
   text: '#f3ead8',
   muted: '#9c8f7a',
   faint: '#5f5546',
@@ -16,6 +15,7 @@ export const COLORS = {
   bad: '#ef6d5a',
   food: '#b6e35a',
   foodCore: '#f4f7c8',
+  foodRim: '#16120f',
   select: '#fff3c4',
   travel: '#8fc7ef',
 };

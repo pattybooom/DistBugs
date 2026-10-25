@@ -1,3 +1,4 @@
+import { hexAt, isSolid, terrainAt } from '../src/game/hexmap';
 import { Random } from '../src/game/Random';
 import {
   CONTACT_RADIUS,
@@ -105,21 +106,21 @@ describe('food', () => {
     expect(state.foodTimerS).toBeGreaterThan(0);
   });
 
-  test('never spawns food inside a structure or water', () => {
+  test('never spawns food on or beside a water or structure hex', () => {
     const state = running(1);
     state.arena = {
       ...state.arena,
       water: [{ x: 180, y: 260, radius: 34, kind: 'water' }],
       structures: [{ x: 80, y: 180, width: 70, height: 70, kind: 'rock' }],
     };
+    expect(isSolid(terrainAt(state.arena, hexAt({ x: 180, y: 260 })))).toBe(true);
+    expect(isSolid(terrainAt(state.arena, hexAt({ x: 115, y: 215 })))).toBe(true);
     for (let i = 0; i < 100; i += 1) {
       state.foodTimerS = STEP_S / 2;
       stepSimulation(state);
       const food = state.food[state.food.length - 1];
-      const insideRock = food.x >= 80 - EAT_RADIUS && food.x <= 150 + EAT_RADIUS
-        && food.y >= 180 - EAT_RADIUS && food.y <= 250 + EAT_RADIUS;
-      const insideWater = distance(food, { x: 180, y: 260 }) < 34 + EAT_RADIUS;
-      expect(insideRock || insideWater).toBe(false);
+      const probes = [{ x: 0, y: 0 }, ...Array.from({ length: 6 }, (_, k) => ({ x: Math.cos((k * Math.PI) / 3) * EAT_RADIUS, y: Math.sin((k * Math.PI) / 3) * EAT_RADIUS }))];
+      for (const probe of probes) expect(isSolid(terrainAt(state.arena, hexAt({ x: food.x + probe.x, y: food.y + probe.y })))).toBe(false);
       state.food = [];
     }
   });
