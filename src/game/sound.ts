@@ -1,8 +1,8 @@
-import { Audio } from 'expo-av';
+import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { Biome, SimulationEvent } from './types';
 
 type SoundName = 'eat' | 'hit' | 'power' | 'defeat' | 'ambient';
-const cache = new Map<SoundName, Audio.Sound>();
+const cache = new Map<SoundName, ReturnType<typeof createAudioPlayer>>();
 let lastPlayed = new Map<SoundName, number>();
 
 function wavData(frequency: number, durationS: number, volume = 0.18): string {
@@ -32,9 +32,11 @@ export async function playSound(name: SoundName, enabled = true): Promise<void> 
   if (now - (lastPlayed.get(name) ?? 0) < (name === 'ambient' ? 4000 : 70)) return;
   lastPlayed.set(name, now);
   try {
+    await setAudioModeAsync({ playsInSilentMode: true });
     let sound = cache.get(name);
-    if (!sound) { const result = await Audio.Sound.createAsync({ uri: sources[name] }); sound = result.sound; cache.set(name, sound); }
-    await sound.replayAsync();
+    if (!sound) { sound = createAudioPlayer(sources[name]); cache.set(name, sound); }
+    await sound.seekTo(0);
+    sound.play();
   } catch { /* Audio is best-effort; simulation must never depend on it. */ }
 }
 

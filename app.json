@@ -14,7 +14,8 @@
           "defaultLaunchURL": "http://10.21.240.35:8081"
         }
       ],
-      "./plugins/withParallaxIos"
+      "./plugins/withParallaxIos",
+      "expo-audio"
     ],
     "ios": {
       "supportsTablet": true,
