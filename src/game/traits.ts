@@ -11,7 +11,7 @@ export type BehaviourSpec = {
   default: number;
   /** Workshop increment. */
   step: number;
-  /** Retained for save compatibility; battle inheritance never mutates this value. */
+  /** Largest change to this trait in one birth, in either direction. */
   mutation: number;
   integer?: boolean;
   format: (value: number) => string;
@@ -107,9 +107,4 @@ export function inheritTraits(parent: TraitSet, rng: Random): { traits: TraitSet
   })) as BehaviourTraits;
   const visualMutation = rng.chance(VISUAL_MUTATION_CHANCE);
   return { traits: { visual: visualMutation ? mutateVisual(parent.visual, rng) : { ...parent.visual }, behaviour }, visualMutation };
-}
-
-/** Battle breeding keeps the exact parent build; this is intentionally mutation-free. */
-export function inheritBattleTraits(parent: TraitSet): { traits: TraitSet; visualMutation: boolean } {
-  return { traits: { visual: { ...parent.visual }, behaviour: { ...parent.behaviour } }, visualMutation: false };
 }

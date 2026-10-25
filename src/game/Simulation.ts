@@ -1,6 +1,6 @@
 import { Random } from './Random';
 import { generateArena, isBlocked, resolveArenaCollision } from './arena';
-import { BEHAVIOUR_SPECS, defaultTraits, inheritBattleTraits, inheritTraits, randomTraits } from './traits';
+import { BEHAVIOUR_SPECS, defaultTraits, inheritTraits, randomTraits } from './traits';
 import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, PowerId, SimulationEvent, SimulationState, TraitSet } from './types';
 
 /** Fixed timestep: the simulation always advances in steps of this length, whatever the frame rate. */
@@ -388,7 +388,8 @@ export const canBreed = (bug: Bug) =>
   isMature(bug) && bug.foodEaten >= bug.traits.behaviour.foodForReproduction && bug.satiety >= BREEDING_MIN_SATIETY;
 
 function breed(state: SimulationState, parent: Bug, rng: Random, events: SimulationEvent[]) {
-  const { traits, visualMutation } = state.mode === 'battle' ? inheritBattleTraits(parent.traits) : inheritTraits(parent.traits, rng);
+  // Battle offspring mutate like any other: fights and hunger decide which changes survive to breed.
+  const { traits, visualMutation } = inheritTraits(parent.traits, rng);
   const angle = rng.range(-Math.PI, Math.PI);
   const { width, height } = state.habitat;
   const at = {

@@ -1,4 +1,4 @@
-import { createSimulation, releaseStarters, stepSimulation, STEP_S } from '../src/game/Simulation';
+import { createSimulation, MATURITY_FRACTION, releaseStarters, stepSimulation, STEP_S } from '../src/game/Simulation';
 import { defaultTraits } from '../src/game/traits';
 
 test('battle arenas are deterministic and release one owned starter', () => {
@@ -25,4 +25,23 @@ test('battle aggression produces combat damage and battle completion', () => {
   const events = stepSimulation(state, { dt: STEP_S });
   expect(events.some((event) => event.type === 'attacked')).toBe(true);
   expect(state.bugs.some((bug) => bug.health < bug.maxHealth)).toBe(true);
+});
+
+test('battle offspring mutate: a child can differ from its parent, and stays within range', () => {
+  let changed = 0;
+  for (let seed = 1; seed <= 30; seed += 1) {
+    const state = createSimulation(seed);
+    releaseStarters(state, [defaultTraits()]);
+    state.mode = 'battle';
+    state.food = [];
+    state.foodTimerS = 1e6;
+    const parent = state.bugs[0];
+    Object.assign(parent, { ageS: parent.traits.behaviour.lifespanS * MATURITY_FRACTION + 1, foodEaten: parent.traits.behaviour.foodForReproduction, satiety: 100 });
+    stepSimulation(state, { dt: STEP_S });
+    const child = state.bugs.find((bug) => bug.parentId === parent.id);
+    if (!child) continue;
+    expect(child.inherited).toEqual(parent.traits);
+    if (JSON.stringify(child.traits) !== JSON.stringify(parent.traits)) changed += 1;
+  }
+  expect(changed).toBeGreaterThan(0);
 });
