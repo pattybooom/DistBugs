@@ -20,6 +20,7 @@ export function JoinOverlay({
   onClose,
   theme = LAB_THEME,
   camera,
+  onScreenMarkers = false,
 }: {
   role: PhoneRole | null;
   note: string | null;
@@ -28,6 +29,8 @@ export function JoinOverlay({
   onClose: () => void;
   theme?: JoinOverlayTheme;
   camera?: CameraControls;
+  /** The phones draw their own tracking squares; no printed markers or reference board. */
+  onScreenMarkers?: boolean;
 }) {
   const trail = useRef<TouchSample[]>([]);
   const startedAt = useRef(0);
@@ -62,9 +65,9 @@ export function JoinOverlay({
       <ScrollView scrollEnabled={!!camera?.enabled} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.copy}>
         <Text style={[styles.eyebrow, { color: theme.accent }]}>{role ? `PHONE ${role}` : 'NOT CONNECTED'}</Text>
         <Text style={[styles.title, { color: theme.text }]}>{camera?.enabled ? 'Position both phones\nunder the camera' : 'Swipe across\nboth screens'}</Text>
-        {camera && <CameraJoinControls camera={camera} role={role} />}
+        {camera && <CameraJoinControls camera={camera} role={role} onScreenMarkers={onScreenMarkers} />}
         <Text style={[styles.hint, { color: theme.muted }]}>
-          {camera?.enabled ? 'Keep both phone markers and all four reference markers visible. Hold still for one second to join automatically.' : 'Swipe fallback: lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.'}
+          {camera?.enabled ? (onScreenMarkers ? 'Lay both phones flat under the camera and keep each tracking square visible. Bugs cross on the side that faces the other phone.' : 'Keep both phone markers and all four reference markers visible. Hold still for one second to join automatically.') : 'Swipe fallback: lay both phones flat with their edges touching. Drag one finger from this screen straight onto the other, without stopping.'}
         </Text>
         <Text style={[styles.status, { color: theme.text }]}>{status}</Text>
         {note && <Text style={[styles.note, { color: theme.warn }]}>{note}</Text>}

@@ -18,6 +18,10 @@ export type CrossingLink = {
   other: ScreenPose;
   ownLayout: HabitatLayout;
   otherLayout: HabitatLayout;
+  /** When set, only this wall opens: the one facing the other phone (see `withFacing`). */
+  facing?: HabitatEdge | null;
+  /** Furthest jump for this link; `MAX_CROSSING_GAP_MM` when unset. Camera tracking is a little less exact than a swipe. */
+  maxGapMm?: number;
 };
 
 export type Landing = { x: number; y: number; heading: number };
@@ -27,6 +31,9 @@ export type Landing = { x: number; y: number; heading: number };
  * bezels (7 mm) plus slack for cases and an imperfect join: bugs cross only where the screens' edges meet.
  */
 export const MAX_CROSSING_GAP_MM = 15;
+/** Camera-tracked links allow a little more slack for the camera's few millimetres of error. */
+export const CAMERA_CROSSING_GAP_MM = 20;
+const DEFAULT_SCREEN_CM = { width: 7, height: 15 };
 const SEARCH_STEP_MM = 1;
 /** Arrivals start this far inside the wall, in habitat units, so they don't bounce straight back. */
 const ARRIVAL_INSET = 10;
@@ -53,6 +60,29 @@ export function crossingPoses(stitch: Stitch, role: 'A' | 'B'): { own: ScreenPos
   const poses = screenPoses(stitch, FIXED_JOIN_HEADING, FIXED_JOIN_HEADING + stitch.relativeYawRad);
   return role === 'A' ? { own: poses.A, other: poses.B } : { own: poses.B, other: poses.A };
 }
+
+/**
+ * The wall of this phone's habitat that faces the other phone, from where the two screens lie on
+ * the table: the side along which the screens are adjacent, judged against how far each screen
+ * reaches that way, so a short phone beside a tall one still picks the wall they share.
+ */
+export function facingEdge(link: Pick<CrossingLink, 'own' | 'other'>): HabitatEdge {
+  const { own, other } = link;
+  const apart = rotate({ x: other.centreMm.x - own.centreMm.x, y: other.centreMm.y - own.centreMm.y }, -(own.headingRad - Math.PI / 2));
+  const turn = other.headingRad - own.headingRad;
+  const c = Math.abs(Math.cos(turn));
+  const s = Math.abs(Math.sin(turn));
+  const o = own.screenSizeCm ?? DEFAULT_SCREEN_CM;
+  const t = other.screenSizeCm ?? DEFAULT_SCREEN_CM;
+  // Half the sum of both extents along each of this screen's axes, in mm (cm × 10 ÷ 2).
+  const reachX = (o.width + c * t.width + s * t.height) * 5;
+  const reachY = (o.height + s * t.width + c * t.height) * 5;
+  if (Math.abs(apart.x) / reachX >= Math.abs(apart.y) / reachY) return apart.x >= 0 ? 'right' : 'left';
+  return apart.y >= 0 ? 'top' : 'bottom';
+}
+
+/** The link with crossing limited to the wall that faces the other phone. */
+export const withFacing = (link: CrossingLink): CrossingLink => ({ ...link, facing: facingEdge(link) });
 
 /** Inverse of `tableToScreen`. */
 export function screenToTable(point: { xPt: number; yPt: number }, pose: ScreenPose, screen: ScreenSize, pointsPerMm = POINTS_PER_MM): PointMm {
@@ -85,9 +115,11 @@ const tableToHeading = (angle: number, pose: ScreenPose) => wrapAngle(-(angle - 
 
 /** Where a bug leaving this habitat at `point` through `edge` arrives in the other, or null if that wall is closed. */
 export function crossingLanding(link: CrossingLink, point: { x: number; y: number }, edge: HabitatEdge, heading: number): Landing | null {
+  if (link.facing && edge !== link.facing) return null;
+  const maxGap = link.maxGapMm ?? MAX_CROSSING_GAP_MM;
   const start = screenToTable(habitatToScreen(point, link.ownLayout), link.own, link.ownLayout.screen);
   const out = rotate(OUTWARD[edge], link.own.headingRad - Math.PI / 2);
-  for (let gap = SEARCH_STEP_MM; gap <= MAX_CROSSING_GAP_MM; gap += SEARCH_STEP_MM) {
+  for (let gap = SEARCH_STEP_MM; gap <= maxGap; gap += SEARCH_STEP_MM) {
     const onOther = tableToScreen({ x: start.x + out.x * gap, y: start.y + out.y * gap }, link.other, link.otherLayout.screen);
     if (!insideField(onOther, link.otherLayout)) continue;
     const arrival = screenToHabitat(onOther, link.otherLayout);

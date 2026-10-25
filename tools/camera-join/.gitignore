@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
 calibration.json
+swipe-calibration.json
 config.json
 markers/

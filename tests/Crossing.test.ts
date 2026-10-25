@@ -2,6 +2,7 @@ import {
   CrossingLink,
   crossingLanding,
   crossingPoses,
+  facingEdge,
   FIXED_JOIN_HEADING,
   HabitatLayout,
   habitatToScreen,
@@ -9,6 +10,7 @@ import {
   parseCrossingMessage,
   screenToTable,
   serializeCrossingMessage,
+  withFacing,
 } from '../src/game/crossing';
 import {
   admitBug,
@@ -23,7 +25,7 @@ import {
 } from '../src/game/Simulation';
 import { SimulationDriver } from '../src/game/SimulationDriver';
 import { Bug, SimulationEvent, SimulationState } from '../src/game/types';
-import { BEZEL_MM, computeStitch, POINTS_PER_MM, ScreenSize, serializeStitchMessage, Stitch, SwipeReport, tableToScreen } from '../src/spatial/Stitch';
+import { BEZEL_MM, computeStitch, POINTS_PER_MM, ScreenPose, ScreenSize, serializeStitchMessage, Stitch, SwipeReport, tableToScreen } from '../src/spatial/Stitch';
 
 const SCREEN: ScreenSize = { widthPt: 402, heightPt: 874 };
 const HALF_WIDTH_MM = SCREEN.widthPt / POINTS_PER_MM / 2;
@@ -315,5 +317,35 @@ describe('full-screen habitats on the two test phones', () => {
     const leftAt = screenToTable(habitatToScreen({ x: A.habitat.width, y: A.habitat.height * 0.25 }, A), a.own, IPHONE_17);
     const arrivedAt = screenToTable(habitatToScreen(landing, B), a.other, IPHONE_14_PLUS);
     expect(arrivedAt.y).toBeCloseTo(leftAt.y, 0);
+  });
+});
+
+describe('only the wall facing the other phone opens', () => {
+  const pose = (x: number, y: number, headingRad = Math.PI / 2): ScreenPose => ({ centreMm: { x, y }, headingRad, screenSizeCm: { width: 7, height: 15 } });
+  const facing = (x: number, y: number) => facingEdge({ own: pose(0, 0), other: pose(x, y) });
+
+  test('the wall is the side along which the screens are adjacent', () => {
+    expect(facing(80, 0)).toBe('right');
+    expect(facing(-80, 0)).toBe('left');
+    expect(facing(0, 170)).toBe('top');
+    expect(facing(0, -170)).toBe('bottom');
+    expect(facing(80, 100)).toBe('right');
+    expect(facing(50, 140)).toBe('top');
+  });
+
+  test('turning this phone turns the facing wall with it', () => {
+    // Heading is where the screen's top points; with the top pointing along -x, up the table is the screen's right.
+    expect(facingEdge({ own: pose(0, 0, Math.PI), other: pose(0, 170, Math.PI) })).toBe('right');
+  });
+
+  test('crossing is limited to that wall and to the link\'s own reach', () => {
+    const stitch = sideBySide();
+    const a = withFacing(link(stitch, 'A'));
+    const mid = { x: LAYOUT.habitat.width, y: LAYOUT.habitat.height / 2 };
+    expect(a.facing).toBe('right');
+    expect(withFacing(link(stitch, 'B')).facing).toBe('left');
+    expect(crossingLanding(a, mid, 'right', 0)).not.toBeNull();
+    expect(crossingLanding({ ...a, facing: 'left' }, mid, 'right', 0)).toBeNull();
+    expect(crossingLanding({ ...a, maxGapMm: 1 }, mid, 'right', 0)).toBeNull();
   });
 });

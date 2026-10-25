@@ -21,8 +21,8 @@ export function LinkSheet({ bridge, onClose }: { bridge: BugBridge; onClose: () 
         <TouchableOpacity onPress={onClose} hitSlop={10}><Text style={styles.close}>✕</Text></TouchableOpacity>
       </View>
       <Text style={styles.hint}>
-        Open Link on both phones and connect from one. Position both phones under the calibrated MacBook camera.
-        Bugs that walk off the touching edge cross to the other phone.
+        Open Link on both phones and connect from one, then connect the MacBook camera on both. Lay the phones flat under it; each shows a small tracking square.
+        Bugs can only cross on the side that faces the other phone, and the phones can be moved while linked.
       </Text>
       <Text style={[styles.status, bridge.status === 'joined' && styles.statusJoined]}>
         {STATUS_TEXT[bridge.status]}{bridge.role ? ` · PHONE ${bridge.role}` : ''}
@@ -48,7 +48,7 @@ export function LinkSheet({ bridge, onClose }: { bridge: BugBridge; onClose: () 
       )}
 
       {connected && (
-        <CameraJoinControls camera={bridge.camera} role={bridge.role} />
+        <CameraJoinControls camera={bridge.camera} role={bridge.role} onScreenMarkers />
       )}
 
       {connected && !bridge.camera.enabled && (

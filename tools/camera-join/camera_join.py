@@ -14,7 +14,10 @@ import numpy as np
 from websockets.asyncio.server import serve, broadcast
 from websockets.exceptions import ConnectionClosed
 
-from geometry import StabilityGate, phone_pose, polygon_gap, project
+from geometry import StabilityGate, phone_pose, screen_phone_pose, polygon_gap, project
+from manual_calibration import calibrate_manual
+from screen_calibration import ScreenAnchor
+from smoothing import PoseSmoother
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE_IDS = (10, 11, 12, 13)  # top-left, top-right, bottom-right, bottom-left
@@ -42,7 +45,24 @@ def load_config(path):
         offset = p.get("marker_offset_cm", [0, 0])
         if len(offset) != 2 or not all(math.isfinite(x) for x in offset) or not math.isfinite(p.get("marker_rotation_deg", 0)):
             raise ValueError("Marker offsets and rotation must be finite")
+    check_screen_marker(config)
     return config
+
+
+def screen_marker_cm(config):
+    """Side of the square a phone draws on its own screen; the printed-board markers keep `phone_marker_cm`."""
+    return config.get('screen_marker_cm', config['phone_marker_cm'])
+
+
+def check_screen_marker(config):
+    size = screen_marker_cm(config)
+    if not math.isfinite(size) or size <= 0:
+        raise ValueError('screen_marker_cm must be positive and finite')
+    for p in config['phones']:
+        ox, oy = p.get('marker_offset_cm', [0, 0])
+        # The square plus its white margin (a sixth of its side on each edge) must stay on the screen.
+        if abs(ox) > p['width_cm'] / 2 - size * 7 / 12 or abs(oy) > p['height_cm'] / 2 - size * 7 / 12:
+            raise ValueError(f"Phone {p['role']} marker_offset_cm puts the square (with its white margin) off the screen")
 
 
 def dictionary():
@@ -52,6 +72,13 @@ def dictionary():
 def detector():
     parameters = cv2.aruco.DetectorParameters()
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    # Small on-screen squares are blurry and low-resolution, so search for smaller, softer, noisier markers than the defaults.
+    parameters.minMarkerPerimeterRate = 0.01
+    parameters.adaptiveThreshWinSizeMax = 43
+    parameters.adaptiveThreshWinSizeStep = 8
+    parameters.polygonalApproxAccuracyRate = 0.05
+    parameters.maxErroneousBitsInBorderRate = 0.5
+    parameters.perspectiveRemovePixelPerCell = 8
     return cv2.aruco.ArucoDetector(dictionary(), parameters)
 
 
@@ -93,6 +120,9 @@ def calibration_valid(calibration, pixels, frame_size, config):
         return "Camera resolution changed; recalibrate"
     if calibration["config"] != config:
         return "Configuration changed; recalibrate"
+    if calibration.get("mode") in ("manual", "screen"):
+        # No printed references: camera motion cannot be detected automatically.
+        return None
     if pixels is None:
         return "Keep all four calibration markers visible"
     shifts = np.linalg.norm(pixels - np.asarray(calibration["pixels"]), axis=1)
@@ -123,12 +153,14 @@ def print_markers(config, output):
     print(f"Print {output / 'print.html'} at 100% / actual size. Reference centre spacing: {w} × {h} cm.")
 
 
-def open_camera(index, width=1920, height=1080):
+def open_camera(index, width=1920, height=1080, fps=None):
     cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera {index}. Grant camera access to your terminal in macOS Settings.")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps:
+        cap.set(cv2.CAP_PROP_FPS, fps)
     return cap
 
 
@@ -194,12 +226,50 @@ def draw(frame, markers, layout, note, matrix=None):
     cv2.putText(frame, note[:130], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 1)
 
 
+def screen_markers(config):
+    return [{"role": p['role'], "markerId": p['marker_id'], "widthCm": p['width_cm'], "heightCm": p['height_cm'],
+             "sizeCm": screen_marker_cm(config), "offsetCm": list(p.get('marker_offset_cm', [0, 0])),
+             "cells": (cv2.aruco.generateImageMarker(dictionary(), p['marker_id'], 6) // 255).tolist()}
+            for p in config['phones']]
+
+
+def swipe_layout(message, phones, invalid, ready_roles, calibration, config, args):
+    reason = invalid
+    if not reason and (len(phones) != 2 or {p['role'] for p in phones} != {'A', 'B'}):
+        reason = 'Keep both on-screen tracking squares visible'
+    if not reason and any(p['confidence'] < getattr(args, 'min_confidence', .2) for p in phones):
+        reason = 'Tracking square too small or unclear; move it closer to the camera'
+    if not reason and polygon_gap(phones[0]['cornersCm'], phones[1]['cornersCm']) < -.2:
+        reason = 'Phone outlines overlap; separate the phones or adjust the area'
+    if not reason and ready_roles != {'A', 'B'}:
+        reason = 'Connect Swipe on both phones, one as A and one as B'
+    result = {**message, 'type': 'layout_invalid' if reason else 'layout', 'reason': reason or 'Tracking phones',
+              'screenMarkers': screen_markers(config), 'calibrationMode': calibration.get('mode', 'board'),
+              'area': {'widthCm': calibration.get('areaWidthCm', config['reference_width_cm']),
+                       'heightCm': calibration.get('areaHeightCm', config['reference_height_cm'])}}
+    if getattr(args, 'media_url', None):
+        result['media'] = {'kind': args.media_kind, 'url': args.media_url, 'width': args.media_width,
+                           'height': args.media_height, 'version': args.media_version, 'position': args.media_position}
+        if getattr(args, 'media_started_ms', None) is not None:
+            result['media']['startedAtMs'] = args.media_started_ms
+    return result
+
+
 async def run(args, config):
-    calibration = json.loads(Path(args.calibration).read_text())
-    matrix = np.asarray(calibration["matrix"], dtype=float)
-    if args.camera != calibration["camera"]:
+    args.media_started_ms = int(time.time() * 1000)  # shared video clock: phones play (now - this) into the loop
+    auto_anchor = getattr(args, 'command', None) == 'swipe' and not getattr(args, 'manual_area', False)
+    calibration = ({'mode': 'screen', 'residualCm': None} if auto_anchor else json.loads(Path(args.calibration).read_text()))
+    matrix = None if auto_anchor else np.asarray(calibration["matrix"], dtype=float)
+    anchor = ScreenAnchor()
+    window_name = 'Swipe - MacBook camera' if getattr(args, 'command', None) == 'swipe' else 'DistBugs camera join'
+    if not auto_anchor and args.camera != calibration["camera"]:
         raise ValueError("Camera index changed; recalibrate")
-    cap, reader, gate = open_camera(args.camera), detector(), StabilityGate()
+    cap = open_camera(args.camera, getattr(args, 'capture_width', 1920), getattr(args, 'capture_height', 1080), getattr(args, 'capture_fps', None))
+    reader, gate = detector(), StabilityGate()
+    rate, last_tick = 0.0, None
+    if hasattr(cap, 'get'):
+        print(f'Camera delivers {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} at {cap.get(cv2.CAP_PROP_FPS):.0f} fps (as reported)', flush=True)
+    smoother = PoseSmoother()
     session, sequence = uuid.uuid4().hex, 0
     calibration_moved = False
     # Camera reads may block. Put capture in a worker so network handling remains responsive.
@@ -215,7 +285,11 @@ async def run(args, config):
                 if state['role'] == role:
                     await previous.close(1000, 'Replaced by reconnect')
                     clients.pop(previous, None)
-            clients[ws] = {'role': role, 'mode': hello.get('mode', 'join'), 'seen': time.monotonic()}
+            screen_aspect = hello.get('screenAspect', 1)
+            if not isinstance(screen_aspect, (int, float)) or isinstance(screen_aspect, bool) or not math.isfinite(screen_aspect) or not .2 <= screen_aspect <= 5:
+                raise ValueError('Invalid screen aspect ratio')
+            clients[ws] = {'role': role, 'mode': hello.get('mode', 'join'), 'seen': time.monotonic(),
+                           'markerOnScreen': hello.get('markerOnScreen') is True, 'screenAspect': screen_aspect}
             async for raw in ws:
                 heartbeat = json.loads(raw)
                 if not isinstance(heartbeat, dict) or heartbeat.get('protocol') != 'distbugs.camera' or heartbeat.get('version') != 1 or heartbeat.get('type') != 'heartbeat' or heartbeat.get('role') != role:
@@ -228,16 +302,32 @@ async def run(args, config):
             clients.pop(ws, None)
     try:
         async with serve(handle, args.host, args.port, max_size=4096, ping_interval=5, ping_timeout=5) as server:
-            print(f"Camera join listening on ws://<Mac Wi-Fi IP>:{args.port} · hostname {socket.gethostname()}")
-            print("Press Q to stop. No images are saved or sent to phones.")
+            print(f"{'Swipe camera' if auto_anchor else 'Camera join'} listening on ws://<Mac Wi-Fi IP>:{args.port} · hostname {socket.gethostname()}", flush=True)
+            print("Press Q to stop. Camera images stay on the Mac.", flush=True)
             while True:
                 start = time.monotonic()
+                if last_tick is not None and start > last_tick:
+                    rate = 1 / (start - last_tick) if not rate else .9 * rate + .1 / (start - last_tick)
+                last_tick = start
                 ok, frame = await asyncio.to_thread(cap.read)
                 markers, phones, invalid = {}, [], None
                 if ok:
                     try:
                         markers = detect(frame, reader)
-                        invalid = calibration_valid(calibration, reference_pixels(markers), (frame.shape[1], frame.shape[0]), config)
+                        if matrix is None:
+                            roles = {s['role'] for s in clients.values() if s['mode'] == 'swipe' and s['markerOnScreen'] and time.monotonic() - s['seen'] <= 1.2}
+                            if roles == {'A', 'B'}:
+                                captured, invalid = anchor.observe(markers, time.monotonic(), config, (frame.shape[1], frame.shape[0]), args.camera)
+                                if captured:
+                                    calibration = captured
+                                    matrix = np.asarray(captured['matrix'], dtype=float)
+                                    invalid = None
+                                    print('Reference captured from phone screens. Move either phone; keep the Mac fixed. R resets.', flush=True)
+                            else:
+                                anchor.reset()
+                                invalid = 'Connect Swipe on both phones, one as A and one as B'
+                        else:
+                            invalid = calibration_valid(calibration, reference_pixels(markers), (frame.shape[1], frame.shape[0]), config)
                         if invalid and ("moved" in invalid or "changed" in invalid):
                             calibration_moved = True
                         if calibration_moved:
@@ -245,16 +335,21 @@ async def run(args, config):
                         if invalid is None:
                             for spec in config["phones"]:
                                 if spec["marker_id"] in markers:
-                                    phones.append(phone_pose(markers[spec["marker_id"]], matrix, spec, config["phone_marker_cm"]))
+                                    screen_client = next((s for s in clients.values() if s['role'] == spec['role'] and s['mode'] == 'swipe'
+                                                          and s['markerOnScreen'] and time.monotonic() - s['seen'] <= 1.2), None)
+                                    if screen_client:
+                                        screen_spec = {**spec, 'height_cm': spec['width_cm'] / screen_client['screenAspect']}
+                                        phones.append(screen_phone_pose(markers[spec['marker_id']], matrix, screen_spec, screen_marker_cm(config)))
+                                    else:
+                                        phones.append(phone_pose(markers[spec["marker_id"]], matrix, spec, config["phone_marker_cm"]))
                     except (ValueError, cv2.error) as error:
                         invalid = str(error)
                 else:
                     invalid = "Camera tracking lost: no frames"
                 stable, stable_ms, reason = gate.observe(phones, time.monotonic(), invalid)
-                ready_roles = {state['role'] for state in clients.values() if time.monotonic() - state['seen'] <= 1.2}
+                ready_roles = {state['role'] for state in clients.values() if state['mode'] == 'join' and time.monotonic() - state['seen'] <= 1.2}
                 if stable and ready_roles != {'A', 'B'}:
                     stable, reason = False, "Connect camera on both phones"
-                live_swipe = any(state['mode'] == 'swipe' for state in clients.values())
                 gap = polygon_gap(phones[0]["cornersCm"], phones[1]["cornersCm"]) if len(phones) == 2 else None
                 centre_distance, relative_yaw = None, None
                 if len(phones) == 2:
@@ -263,24 +358,28 @@ async def run(args, config):
                     centre_distance = math.hypot(b['x']-a['x'], b['y']-a['y'])
                     relative_yaw = math.degrees(math.atan2(math.sin(ordered[1]['headingRad']-ordered[0]['headingRad']), math.cos(ordered[1]['headingRad']-ordered[0]['headingRad'])))
                 sequence += 1
-                live_swipe = any(state['mode'] == 'swipe' for state in clients.values())
-                layout_ready = live_swipe and len(phones) == 2 and ready_roles == {'A', 'B'}
                 message = {"protocol": "distbugs.camera", "version": 1, "sessionId": session, "sequence": sequence,
                            "timestampMs": int(time.time()*1000), "type": "layout" if stable else "layout_invalid",
                            "stableMs": stable_ms, "reason": "Phones aligned" if stable else reason,
                            "coordinateSystem": "table_cm_x_right_y_up", "phones": phones, "edgeGapCm": gap,
                            "calibrationResidualCm": calibration["residualCm"], "jitterCm": gate.jitter_cm,
                            "centreDistanceCm": centre_distance, "relativeYawDeg": relative_yaw}
-                if live_swipe:
-                    message["type"] = "layout" if layout_ready else "layout_invalid"
-                    message["reason"] = "Tracking phones" if layout_ready else (reason if len(phones) != 2 else "Connect camera on both phones")
-                    if args.media_url:
-                        message["media"] = {"kind": args.media_kind, "url": args.media_url,
-                                            "width": args.media_width, "height": args.media_height,
-                                            "version": args.media_version, "position": args.media_position}
-                broadcast(clients, json.dumps(message, allow_nan=False))
+                swipe_roles = {s['role'] for s in clients.values() if s['mode'] == 'swipe' and time.monotonic() - s['seen'] <= 1.2}
+                live_phones = smoother.apply(phones, time.monotonic()) if getattr(args, 'command', None) == 'swipe' else phones
+                live_message = swipe_layout({**message, 'phones': live_phones}, live_phones, invalid, swipe_roles, calibration, config, args)
+                if calibration.get('mode') in ('manual', 'screen'):
+                    message['type'], message['reason'] = 'layout_invalid', 'Screen/area calibration is for Swipe; use reference-board calibration for camera join'
+                for mode, payload in (('join', message), ('swipe', live_message)):
+                    broadcast([ws for ws, state in clients.items() if state['mode'] == mode], json.dumps(payload, allow_nan=False))
                 if ok and not args.headless:
-                    note = f'{message["reason"]} · stable {stable_ms} ms · clients {len(clients)}'
+                    note = f'{live_message["reason"] if swipe_roles or calibration.get("mode") in ("manual", "screen") else message["reason"]} · clients {len(clients)} · {rate:.0f} fps'
+                    if calibration.get('mode') in ('manual', 'screen'):
+                        note += ' · R reset reference · Q quit'
+                    # How big each square looks to the camera, to tell "too small" from "not found".
+                    for spec in config['phones']:
+                        corners = markers.get(spec['marker_id'])
+                        size = f"{min(np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)):.0f} px" if corners is not None else 'not found'
+                        note += f" · {spec['role']} {size}"
                     if gap is not None:
                         note += f' · gap {gap:.2f} cm'
                     draw(frame, markers, phones, note, matrix)
@@ -293,10 +392,20 @@ async def run(args, config):
                             checks += f' | angle error {error:+.1f} deg'
                         cv2.putText(frame, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
                         cv2.putText(frame, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
-                    cv2.imshow("DistBugs camera join", frame)
-                    if cv2.waitKey(1) & 0xff == ord('q'):
+                    cv2.imshow(window_name, frame)
+                    key = cv2.waitKey(1) & 0xff
+                    if key == ord('r') and getattr(args, 'command', None) == 'swipe':
+                        if auto_anchor:
+                            matrix = None
+                            calibration = {'mode': 'screen', 'residualCm': None}
+                            calibration_moved = False
+                            anchor.reset()
+                            gate.reset()
+                            continue
+                        return True
+                    if key == ord('q') or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                         break
-                await asyncio.sleep(max(0, .1 - (time.monotonic() - start)))
+                await asyncio.sleep(max(0, 1 / args.fps - (time.monotonic() - start)))
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -304,14 +413,24 @@ async def run(args, config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("devices", "markers", "calibrate", "run"))
+    parser.add_argument("command", choices=("devices", "markers", "calibrate", "calibrate-manual", "swipe", "run"))
     parser.add_argument("--config", default=str(ROOT / "config.example.json"))
-    parser.add_argument("--calibration", default=str(ROOT / "calibration.json"))
+    parser.add_argument("--calibration", help="Saved calibration file (Swipe uses swipe-calibration.json)")
+    parser.add_argument("--recalibrate", action="store_true", help="Draw a fresh area before starting Swipe")
+    parser.add_argument("--manual-area", action="store_true", help="Optional: draw four corners instead of automatic screen-square setup")
+    parser.add_argument("--area-width-cm", type=float, default=32, help="Estimated area width; default 32 cm")
+    parser.add_argument("--area-height-cm", type=float, default=18, help="Estimated area height; default 18 cm")
     parser.add_argument("--output", default=str(ROOT / "markers"))
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--marker-cm", type=float, help="Swipe: side of the on-screen tracking square in cm (default: screen_marker_cm in the config, else phone_marker_cm)")
+    parser.add_argument("--fps", type=float, default=30, help="Maximum layout updates per second; default 30")
+    parser.add_argument("--capture-width", type=int, default=1920, help="Requested camera width; lower it (for example 1280) if the camera offers more frames per second there")
+    parser.add_argument("--capture-height", type=int, default=1080)
+    parser.add_argument("--capture-fps", type=float, help="Requested camera frame rate, for example 60 if the camera supports it at this resolution")
+    parser.add_argument("--min-confidence", type=float, default=.2, help="Swipe: reject squares below this quality (square side / 40 px); default 0.2 = 8 px")
     parser.add_argument("--media-url", help="Local-network URL for the image or video shown by Swipe")
     parser.add_argument("--media-kind", choices=("image", "video"), default="image")
     parser.add_argument("--media-width", type=int, default=1600)
@@ -321,14 +440,40 @@ def main():
     parser.add_argument("--check-distance-cm", type=float, help="Known screen-centre distance measured with a ruler; shows live error")
     parser.add_argument("--check-angle-deg", type=float, help="Known B-minus-A angle, anticlockwise; shows live error")
     args = parser.parse_args()
+    if args.calibration is None:
+        args.calibration = str(ROOT / ('swipe-calibration.json' if args.command in ('swipe', 'calibrate-manual') else 'calibration.json'))
     if args.command == "devices":
         list_devices()
         return
     config = load_config(args.config)
+    if args.marker_cm is not None:
+        config['screen_marker_cm'] = args.marker_cm
+        check_screen_marker(config)
     if args.command == "markers":
         print_markers(config, Path(args.output))
     elif args.command == "calibrate":
         calibrate(args, config)
+    elif args.command in ('calibrate-manual', 'swipe'):
+        if args.command == 'swipe' and not args.manual_area:
+            while asyncio.run(run(args, config)):
+                pass
+            return
+        needs_setup = args.command == 'calibrate-manual' or args.recalibrate or not Path(args.calibration).exists()
+        while True:
+            if needs_setup:
+                if args.headless:
+                    raise ValueError('Draw the Swipe area without --headless first')
+                cap = open_camera(args.camera)
+                try:
+                    if not calibrate_manual(cap, args, config):
+                        return
+                finally:
+                    cap.release()
+                if args.command == 'calibrate-manual':
+                    return
+            if not asyncio.run(run(args, config)):
+                break
+            needs_setup = True
     else:
         asyncio.run(run(args, config))
 

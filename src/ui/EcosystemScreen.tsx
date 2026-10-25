@@ -1,16 +1,17 @@
 import { useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Dimensions, HostInstance, Pressable, SafeAreaView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Dimensions, GestureResponderEvent, HostInstance, PanResponder, Pressable, SafeAreaView, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import { GateSegment, HabitatLayout } from '../game/crossing';
-import { Random } from '../game/Random';
 import { MATURITY_FRACTION } from '../game/Simulation';
 import { SPRITE_HEIGHT, SPRITE_WIDTH } from '../game/sprites';
-import { Bug, Food, Habitat, SimulationState } from '../game/types';
+import { Bug, Food, SimulationState } from '../game/types';
 import { BugInspector } from './BugInspector';
 import { BugSprite } from './BugSprite';
 import { JoinOverlay } from './JoinOverlay';
 import { LinkSheet } from './LinkSheet';
 import { COLORS, formatClock, PIXEL_FONT } from './theme';
+import { BIOME_GROUND, TileLayer } from './TileLayer';
 import { TraitWorkshop } from './TraitWorkshop';
+import { TrackingSquare } from './TrackingSquare';
 import { BugBridge } from './useBugBridge';
 import { Ecosystem } from './useEcosystem';
 
@@ -28,23 +29,11 @@ const ELDER_SHARE = 0.85;
 const HUNGRY_SATIETY = 30;
 /** Food blinks for this long before it expires. */
 const FOOD_WARNING_S = 4;
-const PEBBLE_COUNT = 40;
 const GATE_WIDTH = 4;
 
 const JOIN_THEME = { background: COLORS.background, accent: COLORS.travel, text: COLORS.text, muted: COLORS.muted, warn: COLORS.warn, border: COLORS.panelBorder };
 
 type Size = { width: number; height: number };
-type Pebble = { x: number; y: number; size: number };
-
-/** Background specks, fixed for each ecosystem so the ground doesn't shuffle on every redraw. */
-function makePebbles(seed: number, habitat: Habitat): Pebble[] {
-  const rng = new Random(seed ^ 0x9e3779b9);
-  return Array.from({ length: PEBBLE_COUNT }, () => ({
-    x: rng.range(0, habitat.width),
-    y: rng.range(0, habitat.height),
-    size: rng.pick([2, 2, 4]),
-  }));
-}
 
 function FoodSprite({ food, timeS, scale }: { food: Food; timeS: number; scale: number }) {
   const left = food.expiresAtS - timeS;
@@ -52,6 +41,9 @@ function FoodSprite({ food, timeS, scale }: { food: Food; timeS: number; scale: 
   const p = FOOD_PIXEL;
   return (
     <View style={[styles.food, { left: Math.round(food.x * scale - p * 1.5), top: Math.round(food.y * scale - p * 1.5), opacity: blinkOff ? 0.3 : 1 }]}>
+      {/* A dark rim keeps food visible on any ground, green grass included. */}
+      <View style={{ position: 'absolute', left: -p / 2, top: p / 2, width: p * 4, height: p * 2, backgroundColor: COLORS.foodRim }} />
+      <View style={{ position: 'absolute', left: p / 2, top: -p / 2, width: p * 2, height: p * 4, backgroundColor: COLORS.foodRim }} />
       <View style={{ position: 'absolute', left: 0, top: p, width: p * 3, height: p, backgroundColor: COLORS.food }} />
       <View style={{ position: 'absolute', left: p, top: 0, width: p, height: p * 3, backgroundColor: COLORS.food }} />
       <View style={{ position: 'absolute', left: p, top: p, width: p, height: p, backgroundColor: COLORS.foodCore }} />
@@ -99,6 +91,32 @@ function GateView({ gate, field, scale }: { gate: GateSegment; field: Size; scal
   return <View style={[styles.gate, style]} />;
 }
 
+const MAX_ZOOM = 4;
+/** Further than this, a one-finger touch is a drag rather than a tap. */
+const DRAG_START_PT = 8;
+
+/** Zoom and scroll, like a map: `x` and `y` shift the zoomed habitat from the screen centre, in screen points. */
+type MapView = { zoom: number; x: number; y: number };
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+/** Keeps the habitat covering the screen: zoom from 1 to MAX_ZOOM, and no scrolling past an edge. */
+function clampView(view: MapView, width: number, height: number): MapView {
+  const zoom = clamp(view.zoom, 1, MAX_ZOOM);
+  const limitX = ((zoom - 1) * width) / 2;
+  const limitY = ((zoom - 1) * height) / 2;
+  return { zoom, x: clamp(view.x, -limitX, limitX), y: clamp(view.y, -limitY, limitY) };
+}
+
+/** Centre of the first two touches and how far apart they are (0 for one finger). */
+function touchesOf(event: GestureResponderEvent) {
+  const touches = event.nativeEvent.touches.slice(0, 2);
+  const x = touches.reduce((sum, touch) => sum + touch.pageX, 0) / touches.length;
+  const y = touches.reduce((sum, touch) => sum + touch.pageY, 0) / touches.length;
+  const spread = touches.length === 2 ? Math.hypot(touches[0].pageX - touches[1].pageX, touches[0].pageY - touches[1].pageY) : 0;
+  return { count: touches.length, x, y, spread };
+}
+
 function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
   state: SimulationState;
   selectedId: string | null;
@@ -107,37 +125,101 @@ function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
   onFieldLayout: (layout: HabitatLayout) => void;
 }) {
   const [frame, setFrame] = useState<Size | null>(null);
-  const [zoom, setZoom] = useState(1);
+  const [view, setView] = useState<MapView>({ zoom: 1, x: 0, y: 0 });
+  const viewRef = useRef(view);
+  const frameInfo = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const gesture = useRef<{ count: number; start: MapView; x: number; y: number; spread: number } | null>(null);
   const frameRef = useRef<HostInstance>(null);
   const { habitat } = state;
-  const pebbles = useMemo(() => makePebbles(state.seed + state.ecosystem, habitat), [state.seed, state.ecosystem, habitat]);
   const scale = frame ? Math.min(frame.width / habitat.width, frame.height / habitat.height) : 0;
   // The habitat has the screen's shape, so this fills the screen; any rounding sliver is centred.
   const field = { width: habitat.width * scale, height: habitat.height * scale };
   const offset = frame ? { x: (frame.width - field.width) / 2, y: (frame.height - field.height) / 2 } : { x: 0, y: 0 };
 
-  // Window coordinates are measured as well, so the other phone can be told where this habitat is drawn.
+  // Tells the other phone where this habitat is drawn in window coordinates. Zoom and scroll move
+  // it, so crossing follows what is on screen: a wall that is scrolled away from the screen's edge is no
+  // longer where the phones touch, and a bug can't cross there.
+  const reportField = (current: MapView) => {
+    const { x, y, width, height } = frameInfo.current;
+    if (!width || !height) return;
+    const fit = Math.min(width / habitat.width, height / habitat.height);
+    const fieldWidth = habitat.width * fit * current.zoom;
+    const fieldHeight = habitat.height * fit * current.zoom;
+    const window = Dimensions.get('window');
+    onFieldLayout({
+      screen: { widthPt: window.width, heightPt: window.height },
+      field: { xPt: x + width / 2 + current.x - fieldWidth / 2, yPt: y + height / 2 + current.y - fieldHeight / 2, widthPt: fieldWidth, heightPt: fieldHeight },
+      habitat,
+    });
+  };
+  const reportRef = useRef(reportField);
+  reportRef.current = reportField;
+
+  const applyView = (next: MapView, report: boolean) => {
+    const { width, height } = frameInfo.current;
+    const clamped = clampView(next, width, height);
+    viewRef.current = clamped;
+    setView(clamped);
+    if (report) reportRef.current(clamped);
+  };
+  const applyViewRef = useRef(applyView);
+  applyViewRef.current = applyView;
+
   const handleLayout = () => {
     frameRef.current?.measureInWindow((xPt, yPt, width, height) => {
+      frameInfo.current = { x: xPt, y: yPt, width, height };
       setFrame({ width, height });
-      const fit = Math.min(width / habitat.width, height / habitat.height);
-      const fieldWidth = habitat.width * fit;
-      const fieldHeight = habitat.height * fit;
-      const window = Dimensions.get('window');
-      onFieldLayout({
-        screen: { widthPt: window.width, heightPt: window.height },
-        field: { xPt: xPt + (width - fieldWidth) / 2, yPt: yPt + (height - fieldHeight) / 2, widthPt: fieldWidth, heightPt: fieldHeight },
-        habitat,
-      });
+      applyViewRef.current(viewRef.current, true);
     });
+  };
+
+  // One finger scrolls, two fingers pinch and scroll together. Taps never start a gesture, so they still pick bugs.
+  const pan = useMemo(() => {
+    const begin = (event: GestureResponderEvent) => {
+      const touch = touchesOf(event);
+      gesture.current = { count: touch.count, start: viewRef.current, x: touch.x, y: touch.y, spread: touch.spread };
+    };
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponderCapture: (event, state) => event.nativeEvent.touches.length >= 2 || Math.hypot(state.dx, state.dy) > DRAG_START_PT,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: begin,
+      onPanResponderMove: (event) => {
+        const touch = touchesOf(event);
+        // A finger landing or lifting restarts from where the view is now, so it never jumps.
+        if (!gesture.current || gesture.current.count !== touch.count) { begin(event); return; }
+        const { start, x, y, spread } = gesture.current;
+        const frameNow = frameInfo.current;
+        if (touch.count === 2 && spread > 0) {
+          const zoom = clamp(start.zoom * (touch.spread / spread), 1, MAX_ZOOM);
+          // Keeps the spot that was between the fingers at the start between them now.
+          const from = { x: x - frameNow.x - frameNow.width / 2, y: y - frameNow.y - frameNow.height / 2 };
+          const to = { x: touch.x - frameNow.x - frameNow.width / 2, y: touch.y - frameNow.y - frameNow.height / 2 };
+          const under = { x: (from.x - start.x) / start.zoom, y: (from.y - start.y) / start.zoom };
+          applyViewRef.current({ zoom, x: to.x - zoom * under.x, y: to.y - zoom * under.y }, false);
+        } else {
+          applyViewRef.current({ zoom: start.zoom, x: start.x + touch.x - x, y: start.y + touch.y - y }, false);
+        }
+      },
+      onPanResponderRelease: () => { gesture.current = null; reportRef.current(viewRef.current); },
+      onPanResponderTerminate: () => { gesture.current = null; reportRef.current(viewRef.current); },
+    });
+  }, []);
+
+  /** The +/- buttons zoom about the middle of the screen. */
+  const zoomBy = (step: number) => {
+    const current = viewRef.current;
+    const zoom = clamp(Math.round((current.zoom + step) * 100) / 100, 1, MAX_ZOOM);
+    applyView({ zoom, x: current.x * (zoom / current.zoom), y: current.y * (zoom / current.zoom) }, true);
   };
 
   const handlePress = (locationX: number, locationY: number) => {
     if (!scale) return;
     const centerX = habitat.width / 2;
     const centerY = habitat.height / 2;
-    const x = ((locationX - offset.x) / scale - centerX) / zoom + centerX;
-    const y = ((locationY - offset.y) / scale - centerY) / zoom + centerY;
+    // The touch is measured on the frame; undo the scroll and zoom, then the fit, to reach habitat units.
+    const x = centerX + (locationX - (frame?.width ?? 0) / 2 - view.x) / view.zoom / scale;
+    const y = centerY + (locationY - (frame?.height ?? 0) / 2 - view.y) / view.zoom / scale;
     let nearest: Bug | null = null;
     let nearestDistance = TAP_RADIUS_PT / scale;
     for (const bug of state.bugs) {
@@ -151,36 +233,21 @@ function HabitatView({ state, selectedId, onSelect, gates, onFieldLayout }: {
   };
 
   return (
-    <Pressable ref={frameRef} style={styles.habitatFrame} onLayout={handleLayout} onPress={(event) => handlePress(event.nativeEvent.locationX, event.nativeEvent.locationY)}>
+    <View style={styles.habitatFrame} {...pan.panHandlers}>
+    <Pressable ref={frameRef} style={StyleSheet.absoluteFill} onLayout={handleLayout} onPress={(event) => handlePress(event.nativeEvent.locationX, event.nativeEvent.locationY)}>
       {/* Children ignore touches so the tap position is always measured against the frame. */}
-      <View pointerEvents="none" style={[styles.field, { left: offset.x, top: offset.y, ...field, transform: [{ scale: zoom }] }]}>
-        {pebbles.map((pebble, index) => (
-          <View
-            key={index}
-            style={[styles.pebble, { left: Math.round(pebble.x * scale), top: Math.round(pebble.y * scale), width: pebble.size, height: pebble.size }]}
-          />
-        ))}
-        {state.arena.water.map((item, index) => <View key={`water-${index}`} style={[styles.water, { left: (item.x - item.radius) * scale, top: (item.y - item.radius) * scale, width: item.radius * 2 * scale, height: item.radius * 2 * scale, borderRadius: item.radius * scale }]} />)}
-        {state.arena.hazards.map((item, index) => <View key={`hazard-${index}`} style={[styles.hazard, { left: (item.x - item.radius) * scale, top: (item.y - item.radius) * scale, width: item.radius * 2 * scale, height: item.radius * 2 * scale, borderRadius: item.radius * scale }]} />)}
-        {state.arena.structures.map((item, index) => <View key={`structure-${index}`} style={[styles.structure, { left: item.x * scale, top: item.y * scale, width: item.width * scale, height: item.height * scale }]} />)}
+      <View pointerEvents="none" style={[styles.field, { left: offset.x, top: offset.y, ...field, backgroundColor: BIOME_GROUND[state.arena.biome], transform: [{ translateX: view.x }, { translateY: view.y }, { scale: view.zoom }] }]}>
+        {scale > 0 && <TileLayer arena={state.arena} habitat={habitat} seed={state.seed} scale={scale} />}
         {gates.map((gate, index) => <GateView key={index} gate={gate} field={field} scale={scale} />)}
         {state.food.map((food) => <FoodSprite key={food.id} food={food} timeS={state.timeS} scale={scale} />)}
         {state.bugs.map((bug) => <BugView key={bug.id} bug={bug} scale={scale} selected={bug.id === selectedId} />)}
       </View>
       <View style={styles.zoomControls}>
-        <TouchableOpacity style={styles.zoomButton} onPress={() => setZoom((value) => Math.min(2, Math.round((value + 0.25) * 100) / 100))}><Text style={styles.zoomText}>+</Text></TouchableOpacity>
-        <Text style={styles.zoomLabel}>{Math.round(zoom * 100)}%</Text>
-        <TouchableOpacity style={styles.zoomButton} onPress={() => setZoom((value) => Math.max(1, Math.round((value - 0.25) * 100) / 100))}><Text style={styles.zoomText}>−</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.zoomButton} onPress={() => zoomBy(0.5)}><Text style={styles.zoomText}>+</Text></TouchableOpacity>
+        <Text style={styles.zoomLabel}>{Math.round(view.zoom * 100)}%</Text>
+        <TouchableOpacity style={styles.zoomButton} onPress={() => zoomBy(-0.5)}><Text style={styles.zoomText}>−</Text></TouchableOpacity>
       </View>
     </Pressable>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string | number }) {
-  return (
-    <View style={styles.stat}>
-      <Text style={styles.statValue}>{value}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
     </View>
   );
 }
@@ -206,10 +273,14 @@ function EndedCard({ state, onRestart }: { state: SimulationState; onRestart: ()
 export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: Ecosystem; bridge: BugBridge; onOpenLab: () => void }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [linkOpen, setLinkOpen] = useState(false);
+  const window = useWindowDimensions();
   const { state } = ecosystem;
   const joinOverlay = bridge.joinOpen && (
-    <JoinOverlay role={bridge.role} note={bridge.joinNote} status={bridge.joinStatus} onSwipe={bridge.handleSwipe} onClose={bridge.closeJoin} theme={JOIN_THEME} camera={bridge.camera} />
+    <JoinOverlay role={bridge.role} note={bridge.joinNote} status={bridge.joinStatus} onSwipe={bridge.handleSwipe} onClose={bridge.closeJoin} theme={JOIN_THEME} camera={bridge.camera} onScreenMarkers />
   );
+  // The camera finds each phone by the square it draws, so it stays on top of everything while tracking.
+  const trackingSquare = bridge.camera.enabled && bridge.camera.marker
+    ? <TrackingSquare marker={bridge.camera.marker} width={window.width} height={window.height} /> : null;
 
   if (!ecosystem.loaded || !state) {
     return (
@@ -232,12 +303,12 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
           onOpenLab={onOpenLab}
         />
         {joinOverlay}
+        {trackingSquare}
       </View>
     );
   }
 
   const selected = selectedId ? state.bugs.find((bug) => bug.id === selectedId) ?? null : null;
-  const deaths = state.stats.starvations + state.stats.oldAgeDeaths;
   const confirmRestart = () => Alert.alert(
     'Start a new ecosystem?',
     `Ecosystem #${state.ecosystem} and its ${state.bugs.length} bugs will be gone.`,
@@ -256,34 +327,19 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
       />
       <SafeAreaView style={styles.hud} pointerEvents="box-none">
         <View style={styles.content} pointerEvents="box-none">
-          <View style={styles.panel}>
-            <View style={styles.header}>
-              <View>
-                <Text style={styles.eyebrow}>ECOSYSTEM #{state.ecosystem}</Text>
-                <Text style={styles.title}>DistBugs · {state.arena.biome}</Text>
-              </View>
-              <View style={styles.headerLinks}>
-                <TouchableOpacity onPress={() => { setSelectedId(null); setLinkOpen(true); }} hitSlop={8}>
-                  <Text style={[styles.linkButton, bridge.status === 'joined' && styles.linkButtonJoined]}>
-                    {bridge.status === 'joined' ? 'Linked' : bridge.status === 'off' ? 'Link' : 'Linking…'}
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={onOpenLab} hitSlop={8}>
-                  <Text style={styles.labLink}>Spatial Lab</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={ecosystem.toggleSound} hitSlop={8}>
-                  <Text style={styles.labLink}>{state.soundEnabled ? 'Sound on' : 'Muted'}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            <View style={styles.stats}>
-              <Stat label="BUGS" value={state.bugs.length} />
-              <Stat label="FOOD" value={state.food.length} />
-              <Stat label="GEN" value={state.stats.maxGeneration} />
-              <Stat label="BORN" value={state.stats.births} />
-              <Stat label="DIED" value={deaths} />
-              <Stat label="TIME" value={formatClock(state.timeS)} />
-              {state.mode === 'battle' && <Stat label="POWER" value={state.bugs.find((bug) => bug.owner === 'local')?.power ?? '—'} />}
+          <View style={styles.header}>
+            <View style={styles.headerLinks}>
+              <TouchableOpacity onPress={() => { setSelectedId(null); setLinkOpen(true); }} hitSlop={8}>
+                <Text style={[styles.linkButton, bridge.status === 'joined' && styles.linkButtonJoined]}>
+                  {bridge.status === 'joined' ? 'Linked' : bridge.status === 'off' ? 'Link' : 'Linking…'}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={onOpenLab} hitSlop={8}>
+                <Text style={styles.labLink}>Spatial Lab</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={ecosystem.toggleSound} hitSlop={8}>
+                <Text style={styles.labLink}>{state.soundEnabled ? 'Sound on' : 'Muted'}</Text>
+              </TouchableOpacity>
             </View>
           </View>
 
@@ -329,6 +385,7 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
       </SafeAreaView>
       {state.status === 'ended' && <EndedCard state={state} onRestart={() => { setSelectedId(null); ecosystem.restart(); }} />}
       {joinOverlay}
+      {trackingSquare}
     </View>
   );
 }
@@ -340,30 +397,22 @@ const styles = StyleSheet.create({
   content: { flex: 1, paddingHorizontal: 10, paddingTop: 4, paddingBottom: 8, gap: 8 },
   panel: { backgroundColor: 'rgba(15, 13, 11, 0.72)', borderRadius: 16, paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
   middle: { flex: 1 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' },
+  header: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center' },
   eyebrow: { color: COLORS.accent, fontSize: 10, fontWeight: '900', letterSpacing: 1.5, fontFamily: PIXEL_FONT },
   title: { color: COLORS.text, fontSize: 20, fontWeight: '900', letterSpacing: -0.4, marginTop: 2 },
-  labLink: { color: COLORS.muted, fontSize: 12, fontWeight: '700', paddingBottom: 4 },
-  headerLinks: { flexDirection: 'row', alignItems: 'flex-end', gap: 16 },
-  linkButton: { color: COLORS.accent, fontSize: 12, fontWeight: '800', paddingBottom: 4 },
+  labLink: { color: COLORS.muted, fontSize: 12, fontWeight: '700', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 12, overflow: 'hidden', backgroundColor: 'rgba(15, 13, 11, 0.72)' },
+  headerLinks: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  linkButton: { color: COLORS.accent, fontSize: 12, fontWeight: '800', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 12, overflow: 'hidden', backgroundColor: 'rgba(15, 13, 11, 0.72)' },
   linkButtonJoined: { color: COLORS.travel },
   gate: { position: 'absolute', backgroundColor: COLORS.travel, opacity: 0.85 },
-  stats: { flexDirection: 'row', justifyContent: 'space-between' },
-  stat: { alignItems: 'center', flex: 1 },
-  statValue: { color: COLORS.text, fontSize: 15, fontWeight: '800', fontFamily: PIXEL_FONT },
-  statLabel: { color: COLORS.faint, fontSize: 9, fontWeight: '900', letterSpacing: 1, marginTop: 2, fontFamily: PIXEL_FONT },
   habitatFrame: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   field: { position: 'absolute', backgroundColor: COLORS.soil, overflow: 'hidden' },
-  pebble: { position: 'absolute', backgroundColor: COLORS.pebble },
   food: { position: 'absolute', width: FOOD_PIXEL * 3, height: FOOD_PIXEL * 3 },
   selection: { position: 'absolute', width: SELECT_SIZE, height: SELECT_SIZE, borderWidth: 2, borderColor: COLORS.select, borderStyle: 'dashed' },
   hungerTrack: { position: 'absolute', width: 16, height: 3, backgroundColor: 'rgba(0, 0, 0, 0.5)' },
   hungerFill: { height: 3, backgroundColor: COLORS.bad },
   healthTrack: { position: 'absolute', width: 24, height: 3, backgroundColor: 'rgba(0, 0, 0, 0.6)' },
   healthFill: { height: 3 },
-  water: { position: 'absolute', backgroundColor: 'rgba(55, 150, 190, 0.65)', borderWidth: 2, borderColor: 'rgba(150, 220, 230, 0.7)' },
-  hazard: { position: 'absolute', backgroundColor: 'rgba(215, 78, 60, 0.55)', borderWidth: 2, borderColor: COLORS.bad },
-  structure: { position: 'absolute', backgroundColor: 'rgba(72, 55, 42, 0.9)', borderWidth: 2, borderColor: 'rgba(180, 145, 95, 0.8)' },
   zoomControls: { position: 'absolute', right: 12, bottom: 110, alignItems: 'center', gap: 4 },
   zoomButton: { width: 38, height: 38, borderRadius: 12, backgroundColor: 'rgba(15, 13, 11, 0.78)', borderWidth: 1, borderColor: COLORS.panelBorder, alignItems: 'center', justifyContent: 'center' },
   zoomText: { color: COLORS.text, fontSize: 24, fontWeight: '800', lineHeight: 26 },

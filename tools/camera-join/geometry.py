@@ -50,6 +50,40 @@ def phone_pose(pixel_corners, homography, spec, marker_cm):
             "markerCornersPx": pixels.tolist(), "confidence": confidence}
 
 
+def screen_phone_pose(pixel_corners, homography, spec, marker_cm):
+    """Expand a centred screen marker into the screen outline in an approximate table frame.
+
+    Marker-to-screen proportions come from the displayed square; estimated table scale
+    must not reject a readable square just because it isn't exactly 3 cm in that frame.
+    """
+    pixels = np.asarray(pixel_corners, dtype=float).reshape(4, 2)
+    if not np.isfinite(pixels).all():
+        raise ValueError("Invalid screen marker corners")
+    local = rectangle((0, 0), math.pi / 2, marker_cm, marker_cm)
+    rows, values = [], []
+    for (x, y), (u, v) in zip(local, pixels):
+        rows.extend(([x, y, 1, 0, 0, 0, -u*x, -u*y], [0, 0, 0, x, y, 1, -v*x, -v*y]))
+        values.extend((u, v))
+    # The square may sit off the screen centre: [right, up] in cm, so the screen centre is the opposite way.
+    ox, oy = spec.get('marker_offset_cm', (0, 0))
+    try:
+        screen_to_camera = np.append(np.linalg.solve(rows, values), 1).reshape(3, 3)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("Degenerate screen marker") from error
+    screen_to_table = homography @ screen_to_camera
+    outline = project(rectangle((-ox, -oy), math.pi / 2, spec['width_cm'], spec['height_cm']), screen_to_table)
+    centre, right, top = project([[-ox, -oy], [spec['width_cm']/2 - ox, -oy], [-ox, spec['height_cm']/2 - oy]], screen_to_table)
+    heading = wrap(math.atan2(*(top - centre)[::-1]))
+    pixel_side = min(np.linalg.norm(pixels - np.roll(pixels, -1, axis=0), axis=1))
+    width, height = float(2*np.linalg.norm(right-centre)), float(2*np.linalg.norm(top-centre))
+    if not 0.1 < width < 100 or not 0.1 < height < 100 or not np.isfinite(outline).all():
+        raise ValueError("Screen falls outside the estimated plane; adjust the area")
+    return {"role": spec['role'], "markerId": spec['marker_id'], "centreCm": {"x": float(centre[0]), "y": float(centre[1])},
+            "headingRad": heading, "widthCm": width, "heightCm": height,
+            "cornersCm": outline.tolist(), "markerCornersPx": pixels.tolist(),
+            "confidence": float(max(0, min(1, pixel_side/40)))}
+
+
 def polygon_gap(a, b):
     """Minimum outline distance, or negative penetration for overlapping convex rectangles."""
     a, b = np.asarray(a), np.asarray(b)

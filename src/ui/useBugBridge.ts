@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Dimensions } from 'react-native';
 import {
+  CAMERA_CROSSING_GAP_MM,
   CrossingLink,
   crossingLanding,
   CrossingMessage,
@@ -11,8 +12,9 @@ import {
   openGates,
   parseCrossingMessage,
   serializeCrossingMessage,
+  withFacing,
 } from '../game/crossing';
-import { Bug } from '../game/types';
+import { Bug, HabitatEdge } from '../game/types';
 import ParallaxModule, { ConnectionState, Peer } from '../native/ParallaxModule';
 import {
   classifySwipe,
@@ -20,6 +22,7 @@ import {
   matchSwipes,
   parseStitchMessage,
   PhoneRole,
+  ScreenPose,
   serializeStitchMessage,
   Stitch,
   StitchMessage,
@@ -27,7 +30,7 @@ import {
   TouchSample,
 } from '../spatial/Stitch';
 import { DepartedEvent, Ecosystem } from './useEcosystem';
-import { CameraJoinControls, useCameraJoin } from './useCameraJoin';
+import { SwipeTrackingControls, useSwipeTracking } from './useSwipeTracking';
 
 /** A bug the other phone hasn't confirmed by now comes back. */
 const TRANSFER_TIMEOUT_MS = 4000;
@@ -37,7 +40,7 @@ const SWIPE_REPORT_LIFETIME_MS = 3000;
 export type LinkStatus = 'off' | 'searching' | 'connecting' | 'connected' | 'joined';
 
 export type BugBridge = {
-  camera: CameraJoinControls;
+  camera: SwipeTrackingControls;
   status: LinkStatus;
   role: PhoneRole | null;
   peers: Peer[];
@@ -88,6 +91,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinNote, setJoinNote] = useState<string | null>(null);
   const [gates, setGates] = useState<GateSegment[]>([]);
+  const [tracked, setTracked] = useState(false);
 
   // Native callbacks are subscribed once per session, so they read the latest values through refs.
   const ecosystemRef = useRef(ecosystem);
@@ -95,23 +99,32 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   const roleRef = useRef<PhoneRole | null>(null);
   const linkRef = useRef<CrossingLink | null>(null);
   const ownLayoutRef = useRef<HabitatLayout | null>(null);
+  const otherLayoutRef = useRef<HabitatLayout | null>(null);
+  /** Where the camera last put both screens on the table; null whenever tracking isn't good. */
+  const trackedPoses = useRef<{ own: ScreenPose; other: ScreenPose } | null>(null);
+  const gatesAt = useRef(0);
   const pending = useRef(new Map<string, Pending>());
   const swipeReports = useRef<SwipeReport[]>([]);
   const nextTransfer = useRef(1);
 
   const active = enabled && visible;
   const cameraMode = useRef(false);
-  const camera = useCameraJoin(active && connection === 'connected' && role !== null, role, next => {
-    setStitch(next);
-    setJoinOpen(false);
-    setJoinNote(null);
+  const camera = useSwipeTracking(active && connection === 'connected' && role !== null, role, (own, other) => {
+    const first = trackedPoses.current === null;
+    trackedPoses.current = { own, other };
+    if (first) {
+      setTracked(true);
+      setJoinOpen(false);
+      setJoinNote(null);
+      ecosystemRef.current.note('Phones tracked: bugs can cross on the side that faces the other phone', 'travel');
+    }
+    rebuildLink();
   }, reason => {
-    // Clear the live crossing ref synchronously so no bug can leave on stale geometry.
-    linkRef.current = null;
-    ecosystemRef.current.setCrossing(null, null);
-    setGates([]); setStitch(null);
-    if (roleRef.current) setJoinOpen(true);
-    setJoinNote(reason);
+    // Close crossing synchronously so no bug can leave on stale geometry.
+    trackedPoses.current = null;
+    setTracked(false);
+    rebuildLink();
+    ecosystemRef.current.note(reason);
   });
   cameraMode.current = camera.enabled;
 
@@ -132,6 +145,11 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   };
 
   const bounceAll = () => [...pending.current.keys()].forEach(bounce);
+
+  const applyOtherLayout = (layout: HabitatLayout | null) => {
+    otherLayoutRef.current = layout;
+    setOtherLayout(layout);
+  };
 
   const applyStitch = (next: Stitch | null) => {
     setStitch(next);
@@ -175,7 +193,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
     const message = parseCrossingMessage(text);
     if (!message) return;
     if (message.type === 'layout') {
-      setOtherLayout(message.layout);
+      applyOtherLayout(message.layout);
     } else if (message.type === 'bug') {
       const accepted = ecosystemRef.current.admit(message.bug, message.landing);
       sendCrossing({ type: 'bug-ack', transferId: message.transferId, accepted }).catch(() => undefined);
@@ -228,7 +246,7 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
           bounceAll();
           swipeReports.current = [];
           setStitch(null);
-          setOtherLayout(null);
+          applyOtherLayout(null);
           setJoinOpen(false);
         }
       }),
@@ -257,24 +275,55 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
       setConnection('disconnected');
       setRole(null);
       setStitch(null);
-      setOtherLayout(null);
+      applyOtherLayout(null);
       setJoinOpen(false);
     };
     // One native session per activation; the handlers read everything else through refs.
   }, [active]);
 
-  // Opens the walls whenever both phones' layouts and the join are known.
-  useEffect(() => {
-    const link = active && connection === 'connected' && stitch && role && ownLayout && otherLayout ? { ...crossingPoses(stitch, role), ownLayout, otherLayout } : null;
+  const canExit = useCallback((point: { x: number; y: number }, edge: HabitatEdge) => {
+    const link = linkRef.current;
+    return !!link && crossingLanding(link, point, edge, 0) != null;
+  }, []);
+
+  /**
+   * Builds the crossing link from the live camera positions, or from the swipe join, and opens or
+   * closes the walls to match. Only the wall facing the other phone ever opens. Reads refs, so the
+   * camera can call it for every layout.
+   */
+  const rebuildLink = () => {
+    const own = ownLayoutRef.current;
+    const other = otherLayoutRef.current;
+    let link: CrossingLink | null = null;
+    if (active && connection === 'connected' && role && own && other) {
+      if (cameraMode.current) {
+        const poses = trackedPoses.current;
+        if (poses) link = withFacing({ ...poses, ownLayout: own, otherLayout: other, maxGapMm: CAMERA_CROSSING_GAP_MM });
+      } else if (stitch) {
+        link = withFacing({ ...crossingPoses(stitch, role), ownLayout: own, otherLayout: other });
+      }
+    }
+    const wasOpen = linkRef.current !== null;
     linkRef.current = link;
     if (!link) {
-      ecosystem.setCrossing(null, null);
-      setGates([]);
+      ecosystemRef.current.setCrossing(null, null);
+      setGates(current => current.length ? [] : current);
       return;
     }
-    ecosystem.setCrossing((point, edge) => crossingLanding(link, point, edge, 0) != null, sendBug);
-    setGates(openGates(link));
-  }, [active, connection, stitch, role, ownLayout, otherLayout, ecosystem.setCrossing, sendBug]);
+    if (!wasOpen) ecosystemRef.current.setCrossing(canExit, sendBug);
+    // Drawing the gates is the costly part, so a moving camera link redraws them a few times a second.
+    const at = Date.now();
+    if (!wasOpen || !cameraMode.current || at - gatesAt.current > 250) {
+      gatesAt.current = at;
+      const next = openGates(link);
+      setGates(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+    }
+  };
+
+  // Opens the walls whenever the join or live tracking, and both phones' layouts, are known.
+  useEffect(() => {
+    rebuildLink();
+  }, [active, connection, stitch, role, ownLayout, otherLayout, camera.enabled]);
 
   // Tells the other phone whenever this habitat moves on screen.
   useEffect(() => {
@@ -310,15 +359,26 @@ export function useBugBridge(ecosystem: Ecosystem, visible: boolean): BugBridge 
   };
 
   const connected = connection === 'connected' || connection === 'recovering';
-  const status: LinkStatus = !enabled ? 'off' : connected ? (stitch ? 'joined' : 'connected') : connection === 'connecting' ? 'connecting' : 'searching';
+  const status: LinkStatus = !enabled ? 'off' : connected ? (stitch || tracked ? 'joined' : 'connected') : connection === 'connecting' ? 'connecting' : 'searching';
   const joinStatus = camera.enabled ? camera.status : !role
     ? 'Waiting for the connection'
     : stitch
       ? 'Joined'
       : role === 'A' ? 'Waiting for a swipe' : 'Waiting for a swipe · Phone A pairs them';
 
+  const cameraControls: SwipeTrackingControls = {
+    ...camera,
+    // The square has to be on screen for the camera to see it, so the join overlay gets out of the way.
+    connect: () => { camera.connect(); setJoinOpen(false); },
+    disconnect: () => {
+      camera.disconnect();
+      setJoinNote('Camera off · swipe across both screens to join');
+      setJoinOpen(true);
+    },
+  };
+
   return {
-    camera,
+    camera: cameraControls,
     status,
     role,
     peers,

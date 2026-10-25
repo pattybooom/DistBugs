@@ -44,3 +44,17 @@ export function mediaTransform(viewport: SwipeViewport, scalePxPerCm: number, or
     rotate: `${(-viewport.headingRad * 180) / Math.PI}deg`,
   };
 }
+
+/** RN matrix about the image centre: inverse phone pose, +Y up table to +Y down display. */
+export function tabletopMediaPlacement(viewport: SwipeViewport, screen: { width: number; height: number },
+  media: { width: number; height: number }, area: { widthCm: number; heightCm: number }) {
+  const cmPerPixel = Math.min(area.widthCm / media.width, area.heightCm / media.height);
+  const sx = screen.width / viewport.widthCm, sy = screen.height / viewport.heightCm;
+  const s = Math.sin(viewport.headingRad), c = Math.cos(viewport.headingRad);
+  const dx = area.widthCm / 2 - viewport.centreCm.x, dy = area.heightCm / 2 - viewport.centreCm.y;
+  return {
+    width: media.width * cmPerPixel * sx, height: media.height * cmPerPixel * sy,
+    matrix: [s, -c * sy / sx, 0, 0, c * sx / sy, s, 0, 0, 0, 0, 1, 0,
+      (dx * s - dy * c) * sx, (-dx * c - dy * s) * sy, 0, 1],
+  };
+}

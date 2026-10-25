@@ -2,6 +2,8 @@
 
 An experimental, local companion for DistBugs. Python detects printed **ArUco DICT_4X4_50** markers, measures the two screens on a calibrated plane, and streams geometry to the iPhones. Both phones still connect through Multipeer for bug transfer; the webcam replaces the swipe used to locate the screens. The camera sends coordinates, never video. There is no cloud service.
 
+**Swipe now supports on-screen squares with automatic setup. No printing or drawn box is required for Swipe.** The printed-board instructions below remain for the original camera-join mode. See **Swipe media demo** for the new path.
+
 ## Set up this Mac
 
 From the repository root, using Python 3.12 or later:
@@ -72,19 +74,44 @@ Version 1 text JSON uses `protocol: "distbugs.camera"`, a per-run `sessionId`, i
 
 Each client first sends `{ "protocol": "distbugs.camera", "version": 1, "type": "hello", "role": "A" }` (or B), then the same envelope with `type: "heartbeat"` every 400 ms. Valid layouts require a live heartbeat from **both different roles** within 1.2 seconds. Reconnecting the same role replaces its old connection. This also closes crossing on the remaining phone when its partner loses the camera link.
 
-The Mac reads at up to 10 Hz and broadcasts current geometry; it does not replay cached layouts to new connections. Each phone uses its own receipt clock for a 1.2 s watchdog, rather than comparing unsynchronized Mac and iPhone clocks. An explicit invalid message immediately clears camera geometry. Camera mode never substitutes a last-known pose after loss. In-flight bug acknowledgements still use the existing transfer protocol.
+The Mac reads at up to `--fps` (default 30; camera join is unaffected by smoothing) and broadcasts current geometry; it does not replay cached layouts to new connections. Each phone uses its own receipt clock for a 1.2 s watchdog, rather than comparing unsynchronized Mac and iPhone clocks. An explicit invalid message immediately clears camera geometry. Camera mode never substitutes a last-known pose after loss. In-flight bug acknowledgements still use the existing transfer protocol.
 
 ## Swipe media demo
 
-The app's **Open Swipe demo** button opens a separate live-media mode. On the Mac, start the camera companion with a media URL reachable from both phones:
+The app's **Spatial Lab → Open Swipe demo** opens a separate mode. Start a local file server serving only the folder containing your chosen image/video. For example, serve the repository's sample icon in one terminal:
 
 ```sh
-tools/camera-join/.venv/bin/python tools/camera-join/camera_join.py run \
-  --media-url http://<Mac-Wi-Fi-IP>:8000/sample.jpg \
+python3 -m http.server 8000 --directory assets
+```
+
+In another terminal, start Swipe using the built-in MacBook camera (confirmed here as camera 0):
+
+```sh
+tools/camera-join/.venv/bin/python tools/camera-join/camera_join.py swipe --camera 0 \
+  --config tools/camera-join/config.json \
+  --media-url http://<Mac-Wi-Fi-IP>:8000/icon.png \
   --media-kind image
 ```
 
-Use `--media-kind video` for a video URL and provide its pixel dimensions with `--media-width` and `--media-height`. Start a local static file server separately. Open **Swipe** on both phones, choose Phone A or Phone B, enter `ws://<Mac-Wi-Fi-IP>:8765`, and connect. The phones show the media beneath their tracked tabletop rectangles; translation and rotation are live, and a brief camera interruption freezes the last valid view with a warning.
+1. Open Swipe on both phones and choose **A** on one and **B** on the other. This mode connects directly to the Mac; it does not need the native phone-to-phone connection.
+2. Enter `ws://<Mac-Wi-Fi-IP>:8765` and connect. Setup hides and each phone displays a different black-and-white square with a clear white margin. Use **Hide setup** if needed. Keep screen brightness high enough for the camera to read the squares.
+3. Lay both phones flat on the same surface within the camera view. Hold them still for about one second. The tracker uses the known-size square on A to establish the plane, centres the media over the pair, then **freezes that reference**. No extra table markers or calibration file are needed.
+4. Slide and rotate **either or both** phones. The reference remains fixed while both screens move through the image. The square stays visible in each screen's centre; media is shown around it.
+5. Hide a square or interrupt the connection: the last rendered view freezes with a warning. Restore visibility to resume. Keep the MacBook fixed: without static table references the tracker cannot distinguish camera movement from phone movement. Press **R** in the tracker window to capture a new reference after moving the camera; press **Q** to quit.
+
+**Square size and position.** The on-screen square's side is `screen_marker_cm` in `config.json` (default 2 cm; it falls back to `phone_marker_cm`, which the printed-board mode still uses), or `--marker-cm` for a one-off. Smaller squares are less intrusive but read worse: the tracker rejects squares under `--min-confidence` × 40 px, and the first reference capture needs about 24 px, so check the `Q` value in the tracker window and grow the square if it drops. The tracker window also shows each square's size in pixels (`A 21 px`, or `not found`), which tells "too small" from "not seen". The square does not have to be central. Set each phone's `marker_offset_cm` (`[right, up]` in cm from the screen centre) and both the phone and the tracker use it; the white margin must stay on screen, and the tracker refuses a config that puts it off the edge. The initial centring of the media over the pair still uses the squares' centres, so large offsets shift the starting framing by about that much.
+
+Screen sizes in `config.json` set the displayed square's physical size. Example dimensions are estimates; measure active screens if tighter physical alignment is needed. Phone markers and screen surfaces must stay coplanar. Lifting or tilting phones is outside this tabletop demo. The single-square reference is sensitive to small corner errors and lens distortion, particularly far from the starting phones; source/tests do not establish measured hardware accuracy.
+
+**Video needs a range-capable server.** iPhone playback requests byte ranges, which `python3 -m http.server` ignores, so the player shows a crossed-out play button. Serve video folders with `python3 tools/camera-join/serve_media.py <folder> --port 8001` instead (images work with either).
+
+Use `--media-kind video` with a phone-playable video URL and its pixel dimensions (`--media-width`, `--media-height`). Videos are synchronised to the Mac's clock: every message carries the Mac's timestamp and the tracker's start time (`media.startedAtMs`). Each phone estimates its offset from the Mac clock (smallest recent offset, which discounts network delay), works out where the looping video should be, seeks if it is more than 0.15 s off, and otherwise nudges playback speed by up to 4%. Phones stay within roughly tens of milliseconds of each other on a quiet network; restarting the tracker restarts the shared clock. Files must be reachable on the local network. The selected media fits inside the shared 32 × 18 cm canvas by default.
+
+**Smoothness tuning.** The tracker sends up to 30 layouts per second (`--fps`, default 30; it was 10) and runs each phone's position and heading through a One Euro filter (`smoothing.py`): steady phones are heavily smoothed, fast moves track with little lag. The phones blend between packets over the measured packet interval. `--min-confidence` (default 0.2) sets how small a tracking square may be before the layout is rejected: confidence is the square's shortest side in pixels divided by 40, so 0.2 is 8 px (it was 0.4, 16 px, and originally 0.6, 24 px). The marker detector is also tuned to find smaller, blurrier squares than OpenCV's defaults. Lower it (for example `--min-confidence 0.3`) to reduce dropouts at the cost of noisier corners from small squares; moving the phones closer to the camera or using a higher-resolution camera helps more. The initial reference capture needs squares of at least 14 px. The app drops packets below 0.1.
+
+Optional fallback: `swipe --manual-area --recalibrate` opens a draggable four-corner area instead. Keep the same `--config`, `--camera`, and media arguments. Accept the estimated size or override it with `--area-width-cm` / `--area-height-cm`. Space saves and starts tracking; R resets the handles. This uses the separate ignored `swipe-calibration.json`; board-based camera join continues to use `calibration.json`.
+
+Swipe clients add `mode: "swipe"`, `markerOnScreen: true`, and their screen aspect ratio to the camera hello. Packets include validated `screenMarkers` (ID, 6×6 cell grid, screen and square dimensions), `area`, and `calibrationMode`. Setup metadata is sent even while the layout is invalid so the phones can display their squares before detection. Moving layouts are delivered only to Swipe clients; regular camera-join clients retain the stationary gate. Approximate/screen references cannot enable the old camera join. Unreadable squares, overlap, invalid calibration, and missing heartbeats reject live layouts.
 
 ## Verification
 

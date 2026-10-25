@@ -1,10 +1,10 @@
 import { StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { CameraJoinControls as Controls } from './useCameraJoin';
 
-export function CameraJoinControls({ camera, role }: { camera: Controls; role: 'A' | 'B' | null }) {
+export function CameraJoinControls({ camera, role, onScreenMarkers = false }: { camera: Controls; role: 'A' | 'B' | null; onScreenMarkers?: boolean }) {
   return <View style={styles.panel}>
     <Text style={styles.title}>MacBook camera</Text>
-    <Text style={styles.text}>{role ? `PHONE ${role} · use its printed marker` : 'Connect the phones first; the initiator is Phone A.'}</Text>
+    <Text style={styles.text}>{role ? (onScreenMarkers ? `PHONE ${role} · shows a tracking square on its screen` : `PHONE ${role} · use its printed marker`) : 'Connect the phones first; the initiator is Phone A.'}</Text>
     <TextInput style={styles.input} value={camera.address} onChangeText={camera.setAddress}
       placeholder="ws://192.168.1.20:8765" placeholderTextColor="#8e9ca8" autoCapitalize="none"
       autoCorrect={false} keyboardType="url" accessibilityLabel="MacBook camera server address" />
