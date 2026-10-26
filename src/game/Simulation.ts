@@ -1,7 +1,7 @@
 import { Random } from './Random';
 import { generateArena, isBlocked, resolveArenaCollision } from './arena';
 import { BEHAVIOUR_SPECS, defaultTraits, inheritTraits, randomTraits } from './traits';
-import { Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, PowerId, SimulationEvent, SimulationState, TraitSet } from './types';
+import { Biome, Bug, DeathCause, EcosystemStats, Food, Habitat, HabitatEdge, PowerId, SimulationEvent, SimulationState, TraitSet } from './types';
 
 /** Fixed timestep: the simulation always advances in steps of this length, whatever the frame rate. */
 export const STEP_S = 0.05;
@@ -191,18 +191,28 @@ function spawnFood(state: SimulationState, rng: Random): Food {
   return food;
 }
 
-/** Puts the two starters into the habitat and starts the clock. */
-export function releaseStarters(state: SimulationState, starters: [TraitSet, TraitSet] | [TraitSet], power: PowerId = 'dash'): void {
+const POWERS: readonly PowerId[] = ['dash', 'shield', 'stun-pulse', 'regeneration', 'frenzy'];
+
+/**
+ * Puts the starters into the habitat and starts the clock. A `biome` rebuilds the arena as that
+ * biome; without a `power` the starters are dealt one at random.
+ */
+export function releaseStarters(
+  state: SimulationState,
+  starters: [TraitSet, TraitSet] | [TraitSet],
+  { biome, power }: { biome?: Biome; power?: PowerId } = {},
+): void {
   if (state.status !== 'workshop') throw new Error(`Cannot release starters while the ecosystem is ${state.status}`);
   const { width, height } = state.habitat;
+  if (biome && biome !== state.arena.biome) state.arena = generateArena(state.seed, state.habitat, biome);
   // A local launch is a peaceful ecosystem. Battle mode is activated when a remote
   // opponent is admitted by the phone bridge, so one device never ends immediately.
   state.mode = 'ecosystem';
   withRandom(state, (rng) => {
     const local = createBug(state, rng, starters[0], state.arena.spawnPoints[0]);
-    local.owner = 'local'; local.power = power;
+    local.owner = 'local';
     state.bugs = [local];
-    if (starters[1]) { const remote = createBug(state, rng, starters[1], state.arena.spawnPoints[1]); remote.owner = 'remote'; remote.power = power; state.bugs.push(remote); }
+    if (starters[1]) { const remote = createBug(state, rng, starters[1], state.arena.spawnPoints[1]); remote.owner = 'remote'; state.bugs.push(remote); }
     if (starters.length === 1) {
       for (let index = 1; index < STARTING_BATTLE_BUGS; index += 1) {
         const ai = createBug(state, rng, { visual: { ...starters[0].visual }, behaviour: { ...starters[0].behaviour } }, {
@@ -214,6 +224,8 @@ export function releaseStarters(state: SimulationState, starters: [TraitSet, Tra
       }
     }
     for (let i = 0; i < STARTER_FOOD; i += 1) spawnFood(state, rng);
+    const dealt = power ?? rng.pick(POWERS);
+    for (const bug of state.bugs) if (bug.owner !== 'wild') bug.power = dealt;
   });
   state.status = 'running';
   state.paused = false;

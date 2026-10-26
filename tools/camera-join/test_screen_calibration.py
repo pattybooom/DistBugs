@@ -25,7 +25,8 @@ CAMERA = np.array([[20., 1, 180], [1, -20., 550], [.001, .002, 1.]])
 
 class ScreenCalibrationTests(unittest.TestCase):
     def markers(self):
-        return {p['marker_id']: project(rectangle(centre, math.pi/2, 3, 3), CAMERA)
+        marker_cm = CONFIG.get('screen_marker_cm', 3)
+        return {p['marker_id']: project(rectangle(centre, math.pi/2, marker_cm, marker_cm), CAMERA)
                 for p, centre in zip(CONFIG['phones'], ((10, 9), (18, 9)))}
 
     def test_auto_reference_needs_both_screens_and_restarts_after_motion(self):
@@ -47,7 +48,8 @@ class ScreenCalibrationTests(unittest.TestCase):
             calibration, _ = anchor.observe(markers, at, CONFIG, (1280, 720), 0)
         h = np.array(calibration['matrix'])
         for centre, angle in (((-2, 9), 0), ((20, 12), math.pi), ((10, -3), -1.12)):
-            p = screen_phone_pose(project(rectangle(centre, angle, 3, 3), CAMERA), h, CONFIG['phones'][0], 3)
+            marker_cm = CONFIG.get('screen_marker_cm', 3)
+            p = screen_phone_pose(project(rectangle(centre, angle, marker_cm, marker_cm), CAMERA), h, CONFIG['phones'][0], marker_cm)
             # Initial pair centre was (14,9), placed at area centre (16,9).
             self.assertAlmostEqual(p['centreCm']['x'], centre[0] + 2, places=3)
             self.assertAlmostEqual(p['centreCm']['y'], centre[1], places=3)
@@ -61,7 +63,7 @@ class ScreenCalibrationTests(unittest.TestCase):
         world = [[0, 18], [32, 18], [32, 0], [0, 0]]
         corners = project(world, CAMERA)
         h = fit_manual_calibration(corners, 48, 27, (1280, 720))
-        p = screen_phone_pose(self.markers()[0], h, CONFIG['phones'][0], 3)
+        p = screen_phone_pose(self.markers()[0], h, CONFIG['phones'][0], CONFIG.get('screen_marker_cm', 3))
         self.assertGreater(p['confidence'], .6)
         self.assertAlmostEqual(p['centreCm']['x'], 15, places=3)
         self.assertAlmostEqual(p['widthCm'], 1.5*CONFIG['phones'][0]['width_cm'], places=3)
@@ -83,7 +85,8 @@ class ScreenCalibrationTests(unittest.TestCase):
         waiting = app.swipe_layout(base, [], None, {'A', 'B'}, calibration, CONFIG, args)
         self.assertEqual(len(waiting['screenMarkers']), 2)
         self.assertEqual(waiting['calibrationMode'], 'screen')
-        phones = [screen_phone_pose(c, np.linalg.inv(CAMERA), p, 3) for c, p in zip(self.markers().values(), CONFIG['phones'])]
+        marker_cm = CONFIG.get('screen_marker_cm', 3)
+        phones = [screen_phone_pose(c, np.linalg.inv(CAMERA), p, marker_cm) for c, p in zip(self.markers().values(), CONFIG['phones'])]
         self.assertEqual(app.swipe_layout(base, phones, None, {'A', 'B'}, calibration, CONFIG, args)['type'], 'layout')
         poor = copy.deepcopy(phones); poor[0]['confidence'] = .2
         self.assertEqual(app.swipe_layout(base, poor, None, {'A', 'B'}, calibration, CONFIG, args)['type'], 'layout_invalid')
@@ -91,13 +94,100 @@ class ScreenCalibrationTests(unittest.TestCase):
 
 
 class ScreenNetworkTests(unittest.IsolatedAsyncioTestCase):
-    async def test_screen_only_bootstrap_movement_and_occlusion(self):
+    async def test_hidden_game_markers_hold_positions_until_movement_and_expire_on_disconnect(self):
         class Capture:
-            moved = hidden = False
+            visible = {'A': True, 'B': True}
+            second_x = 540
 
             def read(self):
                 image = np.full((720, 1280, 3), 180, np.uint8)
-                positions = ((220 if self.moved else 380, 340), (540, 340))
+                for marker_id, (role, x) in enumerate((('A', 380), ('B', self.second_x))):
+                    if self.visible[role]:
+                        image[328:412, x-12:x+72] = 255
+                        image[340:400, x:x+60] = cv2.cvtColor(cv2.aruco.generateImageMarker(app.dictionary(), marker_id, 60), cv2.COLOR_GRAY2BGR)
+                return True, image
+
+            def release(self):
+                pass
+
+        cap = Capture()
+        probe = socket.socket(); probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]; probe.close()
+        args = SimpleNamespace(command='swipe', manual_area=False, camera=0,
+                               host='127.0.0.1', port=port, headless=True, media_url=None)
+        states = {role: {'motionAvailable': True, 'moving': False, 'markerVisible': True, 'revision': 0}
+                  for role in ('A', 'B')}
+        with patch.object(app, 'open_camera', return_value=cap):
+            task = asyncio.create_task(app.run(args, CONFIG))
+            keepers = []
+            try:
+                for _ in range(40):
+                    try:
+                        first = await connect(f'ws://127.0.0.1:{port}', max_queue=None)
+                        break
+                    except OSError:
+                        await asyncio.sleep(.05)
+                else:
+                    self.fail('Swipe server did not start')
+                async with first, connect(f'ws://127.0.0.1:{port}', max_queue=None) as second:
+                    async def heartbeat(ws, role):
+                        await ws.send(json.dumps({'protocol': 'distbugs.camera', 'version': 1, 'type': 'hello',
+                            'role': role, 'mode': 'swipe', 'markerOnScreen': True, 'screenAspect': .46,
+                            'markerVisibility': 'motion', 'markerTracking': states[role]}))
+                        while True:
+                            await asyncio.sleep(.1)
+                            await ws.send(json.dumps({'protocol': 'distbugs.camera', 'version': 1,
+                                'type': 'heartbeat', 'role': role, 'markerTracking': states[role]}))
+
+                    async def until(predicate):
+                        async with asyncio.timeout(5):
+                            while True:
+                                message = json.loads(await first.recv())
+                                if predicate(message):
+                                    return message
+
+                    keepers = [asyncio.create_task(heartbeat(first, 'A')), asyncio.create_task(heartbeat(second, 'B'))]
+                    initial = await until(lambda m: m['type'] == 'layout')
+                    self.assertEqual(initial['markerRevisions'], {'A': 0, 'B': 0})
+                    for role in states:
+                        states[role]['markerVisible'] = False
+                    await asyncio.sleep(.15)  # the visibility heartbeat must precede hiding the image
+                    cap.visible = {'A': False, 'B': False}
+                    saved = await until(lambda m: m['type'] == 'layout' and 'Positions saved' in m['reason'])
+                    self.assertEqual(saved['markerRevisions'], {'A': 0, 'B': 0})
+                    states['B'].update(moving=True, markerVisible=True, revision=1)
+                    await until(lambda m: m['type'] == 'layout_invalid' and m.get('needsPositionUpdate'))
+                    cap.second_x = 160
+                    cap.visible['B'] = True
+                    moved = await until(lambda m: m['type'] == 'layout' and m['markerRevisions'].get('B') == 1)
+                    a, b = moved['phones']
+                    self.assertLess(b['centreCm']['x'], a['centreCm']['x'])
+                    self.assertEqual(initial['sessionId'], moved['sessionId'])
+                    states['B'].update(moving=False, markerVisible=False)
+                    await asyncio.sleep(.15)
+                    cap.visible['B'] = False
+                    await until(lambda m: m['type'] == 'layout' and m['markerRevisions'].get('B') == 1)
+                    keepers[1].cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await keepers[1]
+                    expired = await until(lambda m: m['type'] == 'layout_invalid')
+                    self.assertTrue(expired['needsPositionUpdate'])
+            finally:
+                for keeper in keepers:
+                    keeper.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, app.ConnectionClosed):
+                        await keeper
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def test_screen_only_bootstrap_movement_and_occlusion(self):
+        class Capture:
+            moved = hidden = False
+            second_x = 540
+
+            def read(self):
+                image = np.full((720, 1280, 3), 180, np.uint8)
+                positions = ((220 if self.moved else 380, 340), (self.second_x, 340))
                 for marker_id, (x, y) in enumerate(positions):
                     if marker_id == 1 and self.hidden:
                         continue
@@ -156,6 +246,16 @@ class ScreenNetworkTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn('visible', lost['reason'])
                         cap.hidden = False
                         await until(lambda m: m['type'] == 'layout')
+                        # Repeated side changes must work in the same session,
+                        # without capturing a new reference or reconnecting.
+                        cap.moved = False
+                        cap.second_x = 160
+                        left = await until(lambda m: m['type'] == 'layout' and
+                                           m['phones'][1]['centreCm']['x'] < m['phones'][0]['centreCm']['x'] - 5)
+                        cap.second_x = 620
+                        right = await until(lambda m: m['type'] == 'layout' and
+                                            m['phones'][1]['centreCm']['x'] > m['phones'][0]['centreCm']['x'] + 5)
+                        self.assertEqual(left['sessionId'], right['sessionId'])
                 finally:
                     for keeper in keepers:
                         keeper.cancel()

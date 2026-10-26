@@ -1,4 +1,5 @@
 import { SwipePose, SwipeRole } from './SwipeViewport';
+import { MarkerTrackingState } from './MarkerVisibility';
 
 export type SwipeMedia = { kind: 'image' | 'video'; url: string; width: number; height: number; version: number; position?: number; startedAtMs?: number };
 export type ScreenMarker = { role: SwipeRole; markerId: number; widthCm: number; heightCm: number; sizeCm: number; cells: number[][]; offsetCm?: [number, number] };
@@ -12,6 +13,8 @@ export type SwipeCameraMessage = {
   area?: SwipeArea;
   calibrationMode?: 'manual' | 'board' | 'screen';
   timestampMs?: number;
+  markerRevisions?: Partial<Record<SwipeRole, number>>;
+  needsPositionUpdate?: boolean;
 };
 
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -26,6 +29,10 @@ export function parseSwipeMessage(text: string): SwipeCameraMessage | null {
       || value.sessionId.length < 1 || value.sessionId.length > 100 || !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0 || !['layout', 'layout_invalid'].includes(value.type as string)
       || value.coordinateSystem !== 'table_cm_x_right_y_up' || typeof value.reason !== 'string') return null;
     if (value.timestampMs !== undefined && !finite(value.timestampMs)) return null;
+    if (value.needsPositionUpdate !== undefined && typeof value.needsPositionUpdate !== 'boolean') return null;
+    if (value.markerRevisions !== undefined && (!record(value.markerRevisions)
+      || Object.entries(value.markerRevisions).some(([role, revision]) => !['A', 'B'].includes(role)
+        || !Number.isSafeInteger(revision) || (revision as number) < 0))) return null;
     if (value.media !== undefined) {
       const m = value.media;
       if (!record(m) || !['image', 'video'].includes(m.kind as string) || typeof m.url !== 'string'
@@ -66,18 +73,24 @@ export class SwipeCameraConnection {
   private session: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastMessage = 0;
+  private markerTracking: MarkerTrackingState | null = null;
+  private role: SwipeRole = 'A';
 
   constructor(private onMessage: (message: SwipeCameraMessage) => void, private onStatus: (status: string) => void, private now = Date.now) {}
 
-  connect(url: string, role: SwipeRole, screenAspect = 1) {
+  connect(url: string, role: SwipeRole, screenAspect = 1, motionTriggeredMarkers = false) {
     this.close();
+    this.role = role;
+    this.markerTracking = motionTriggeredMarkers
+      ? { motionAvailable: false, moving: true, markerVisible: true, revision: 0 } : null;
     if (!/^wss?:\/\/[^\s/]+(?::\d+)?\/?$/.test(url)) throw new Error('Use ws://Mac-Wi-Fi-IP:8765');
     this.sequence = -1; this.session = null; this.lastMessage = this.now();
     const socket = new WebSocket(url);
     this.socket = socket;
     socket.onopen = () => {
       if (this.socket !== socket) return;
-      socket.send(JSON.stringify({ protocol: 'distbugs.camera', version: 1, type: 'hello', role, mode: 'swipe', markerOnScreen: true, screenAspect }));
+      socket.send(JSON.stringify({ protocol: 'distbugs.camera', version: 1, type: 'hello', role, mode: 'swipe', markerOnScreen: true, screenAspect,
+        ...(this.markerTracking ? { markerVisibility: 'motion', markerTracking: this.markerTracking } : {}) }));
       this.onStatus('Camera connected · tracking phones');
     };
     socket.onmessage = event => {
@@ -88,14 +101,27 @@ export class SwipeCameraConnection {
       if (message.sequence <= this.sequence) return;
       this.session = message.sessionId; this.sequence = message.sequence; this.lastMessage = this.now();
       this.onMessage(message);
-      this.onStatus(message.type === 'layout' ? 'Tracking phones' : message.reason);
+      this.onStatus(message.type === 'layout' && !message.markerRevisions ? 'Tracking phones' : message.reason);
     };
     const lost = () => { if (this.socket === socket) { this.onStatus('Tracking lost · reconnect to the Mac'); this.close(); } };
     socket.onerror = lost; socket.onclose = lost;
     this.timer = setInterval(() => {
       if (this.now() - this.lastMessage > 1500) this.onStatus('Waiting for live camera layout');
-      if (this.socket === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ protocol: 'distbugs.camera', version: 1, type: 'heartbeat', role }));
+      if (this.socket === socket && socket.readyState === WebSocket.OPEN) this.sendHeartbeat();
     }, 400);
+  }
+
+  updateMarkerTracking(state: MarkerTrackingState) {
+    if (!this.markerTracking || JSON.stringify(this.markerTracking) === JSON.stringify(state)) return;
+    this.markerTracking = { ...state };
+    this.sendHeartbeat();
+  }
+
+  private sendHeartbeat() {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({
+      protocol: 'distbugs.camera', version: 1, type: 'heartbeat', role: this.role,
+      ...(this.markerTracking ? { markerTracking: this.markerTracking } : {}),
+    }));
   }
 
   close() {

@@ -54,6 +54,7 @@ import {
 } from '../spatial/Stitch';
 import { DistanceFilter, FilteredDistance } from '../state/DistanceFilter';
 import { JoinOverlay } from '../ui/JoinOverlay';
+import { glow, GridBackdrop, HUD, HUD_FONT, HudButton, HudFrame, PulseDot } from '../ui/hud';
 
 const CONNECTION_STATES: ConnectionState[] = ['disconnected', 'connecting', 'connected', 'recovering'];
 /** Swipe halves older than this can no longer pair with a new one. */
@@ -65,7 +66,7 @@ const LINK_TRAVEL_MS = 1100;
 const LINK_SETTLE_MS = 700;
 const LINK_HEAD_SIZE = 26;
 const LINK_RING_SIZE = 64;
-const LINK_COLORS: Record<PhoneRole, string> = { A: '#80aaff', B: '#f0717d' };
+const LINK_COLORS: Record<PhoneRole, string> = { A: HUD.cyan, B: HUD.magenta };
 const SCENE_WIDTH = 340;
 const SCENE_HEIGHT = 410;
 const ORIGIN_X = SCENE_WIDTH / 2;
@@ -197,6 +198,10 @@ function PositionScene({
 
   return (
     <View style={styles.scene}>
+      {[50, 100, 150, 200].map((radius) => (
+        <View key={radius} style={[styles.rangeRing, { left: ORIGIN_X - radius, top: ORIGIN_Y - radius, width: radius * 2, height: radius * 2, borderRadius: radius }]} />
+      ))}
+      <RadarSweep />
       <View style={styles.axisHorizontal} />
       <View style={styles.axisVertical} />
       <View style={[styles.axisLabel, styles.axisLabelX]}><Text style={styles.axisText}>X</Text></View>
@@ -237,6 +242,17 @@ function PositionScene({
       </View>
     </View>
   );
+}
+
+/** A slow radar arm turning around Phone A; decoration only. */
+function RadarSweep() {
+  const turn = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.timing(turn, { toValue: 1, duration: 4000, easing: Easing.linear, useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [turn]);
+  return <Animated.View pointerEvents="none" style={[styles.sweep, { transform: [{ rotate: turn.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] }) }] }]} />;
 }
 
 function DiagnosticRow({ label, value, tone = 'normal' }: { label: string; value: string; tone?: 'normal' | 'good' | 'warn' }) {
@@ -644,24 +660,26 @@ export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void
 
   return (
     <View style={styles.root}>
+      <GridBackdrop />
       <SafeAreaView style={styles.safe}>
         <ScrollView contentContainerStyle={styles.container}>
-          <TouchableOpacity style={styles.exitButton} onPress={onExit}>
-            <Text style={styles.exitButtonText}>‹ Ecosystem</Text>
-          </TouchableOpacity>
-          {onOpenSwipe && <TouchableOpacity style={styles.swipeButton} onPress={onOpenSwipe}>
-            <Text style={styles.swipeButtonText}>Open Swipe demo ↗</Text>
-          </TouchableOpacity>}
+          <View style={styles.topBar}>
+            <HudButton small variant="ghost" label="‹ Ecosystem" onPress={onExit} />
+            {onOpenSwipe && <HudButton small color={HUD.magenta} label="Swipe demo ↗" onPress={onOpenSwipe} />}
+          </View>
           <View style={styles.header}>
-            <View>
-              <Text style={styles.eyebrow}>SPATIAL LAB · PARALLAX M2 · RELATIVE SPACE</Text>
-              <Text style={styles.title}>Two phones. One frame.</Text>
+            <View style={styles.headerText}>
+              <Text style={styles.eyebrow}>SPATIAL LAB // PARALLAX M2 // RELATIVE SPACE</Text>
+              <Text style={styles.title}>TWO PHONES.{'\n'}ONE FRAME.</Text>
               <Text style={styles.subtitle}>Phone A is the connection initiator and fixed origin.</Text>
             </View>
-            <View style={[styles.statusDot, connected && styles.statusDotConnected]} />
+            <View style={styles.linkBadge}>
+              <PulseDot active={connected} />
+              <Text style={[styles.linkBadgeText, connected && styles.goodText]}>{connected ? 'LINKED' : 'NO LINK'}</Text>
+            </View>
           </View>
 
-          <View style={styles.visualPanel}>
+          <HudFrame title="RELATIVE SPACE" tag={joined ? 'LOCKED' : stitchState ? 'DRIFT' : 'SEARCHING'} tagColor={joined ? HUD.good : HUD.warn}>
             <PositionScene
               position={rotatePosition(position, sceneRotation)}
               headingA={turnForScene(headingA)}
@@ -679,12 +697,10 @@ export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void
                 <Text style={styles.rawValue}>{formatDistance(distance.fresh ? distance.rawCm : null)}</Text>
               </View>
             </View>
-            <TouchableOpacity disabled={headingA == null} style={styles.viewButton} onPress={() => setUpHeading(headingA)}>
-              <Text style={[styles.viewButtonText, headingA == null && styles.viewButtonTextDisabled]}>Point +Y where Phone A points now</Text>
-            </TouchableOpacity>
-          </View>
+            <HudButton small variant="ghost" disabled={headingA == null} label="Point +Y where Phone A points now" onPress={() => setUpHeading(headingA)} />
+          </HudFrame>
 
-          <View style={styles.statusPanel}>
+          <HudFrame title="TELEMETRY">
             <DiagnosticRow label="GEOMETRY" value={geometryLabel} tone={joined ? 'good' : 'warn'} />
             <DiagnosticRow label="RELATIVE ROTATION" value={relativeRotationLabel} />
             <DiagnosticRow
@@ -693,57 +709,40 @@ export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void
               tone={uwbResidualCm == null ? 'normal' : Math.abs(uwbResidualCm) <= MOVED_THRESHOLD_CM ? 'good' : 'warn'}
             />
             <DiagnosticRow label="FRAME" value={frameStatus} tone={frameStatus === 'GYRO ONLY' ? 'good' : 'warn'} />
-          </View>
+          </HudFrame>
 
-          <View style={styles.connectionRow}>
-            <View>
-              <Text style={styles.label}>CONNECTION</Text>
-              <Text style={styles.connectionValue}>{connection.toUpperCase()}{localRole ? ` · PHONE ${localRole}` : ''}</Text>
+          <HudFrame title="UPLINK" tag={`${peers.length} ${peers.length === 1 ? 'PEER' : 'PEERS'} IN RANGE`}>
+            <Text style={[styles.connectionValue, connected && styles.goodText]}>{connection.toUpperCase()}{localRole ? ` · PHONE ${localRole}` : ''}</Text>
+            {peers.map((peer) => (
+              <TouchableOpacity key={peer.id} style={styles.peerRow} onPress={() => { void ParallaxModule.connect(peer.id).catch(reportActionError); }}>
+                <View style={styles.peerIcon}><PhoneGlyph accent="red" /></View>
+                <View style={styles.peerInfo}>
+                  <Text style={styles.peerName}>{peer.name}</Text>
+                  <Text style={styles.peerId}>{peer.id}</Text>
+                </View>
+                <Text style={styles.connectAction}>CONNECT ›</Text>
+              </TouchableOpacity>
+            ))}
+            <View style={styles.actions}>
+              <HudButton style={styles.primary} disabled={!canRange} label={canRange ? 'Restart ranging' : 'Awaiting link'} onPress={() => { void ParallaxModule.startRanging().catch(reportActionError); }} />
+              <HudButton variant="ghost" label="Disconnect" onPress={() => { void ParallaxModule.disconnect().catch(reportActionError); }} />
             </View>
-            <Text style={styles.peerCount}>{peers.length} {peers.length === 1 ? 'peer' : 'peers'} nearby</Text>
-          </View>
+          </HudFrame>
 
-          {peers.length > 0 && (
-            <View style={styles.peerList}>
-              <Text style={styles.label}>AVAILABLE PHONES</Text>
-              {peers.map((peer) => (
-                <TouchableOpacity key={peer.id} style={styles.peerRow} onPress={() => { void ParallaxModule.connect(peer.id).catch(reportActionError); }}>
-                  <View style={styles.peerIcon}><PhoneGlyph accent="red" /></View>
-                  <View style={styles.peerInfo}>
-                    <Text style={styles.peerName}>{peer.name}</Text>
-                    <Text style={styles.peerId}>{peer.id}</Text>
-                  </View>
-                  <Text style={styles.connectAction}>CONNECT</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-
-          <View style={styles.actions}>
-            <TouchableOpacity disabled={!canRange} style={[styles.primary, !canRange && styles.primaryDisabled]} onPress={() => { void ParallaxModule.startRanging().catch(reportActionError); }}>
-              <Text style={styles.primaryText}>{canRange ? 'Restart ranging' : 'Waiting for connection'}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.secondary} onPress={() => { void ParallaxModule.disconnect().catch(reportActionError); }}>
-              <Text style={styles.secondaryText}>Disconnect</Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.joinPanel}>
-            <Text style={styles.label}>CAMERA JOIN</Text>
-            <CameraJoinControls camera={camera} role={localRole} />
+          <HudFrame title="CAMERA JOIN" accent={HUD.magenta}>
+            <CameraJoinControls camera={camera} role={localRole} theme={CAMERA_THEME} />
             <Text style={styles.joinPanelHint}>
               Position both phones under the calibrated MacBook camera. Attach the matching printed marker to each phone.
               Camera tracking rejoins automatically after a move. Disable the camera to use the swipe fallback.
             </Text>
-            <TouchableOpacity disabled={!canRange || camera.enabled} style={[styles.joinButton, (!canRange || camera.enabled) && styles.joinButtonDisabled]} onPress={requestJoin}>
-              <Text style={styles.joinButtonText}>Swipe fallback</Text>
-            </TouchableOpacity>
-          </View>
+            <HudButton variant="ghost" disabled={!canRange || camera.enabled} label="Swipe fallback" onPress={requestJoin} />
+          </HudFrame>
 
-          <Text style={styles.label}>SENSOR DIAGNOSTICS</Text>
-          <View style={styles.diagnostics}>
+          <HudFrame title="SENSOR DIAGNOSTICS">
             <RoleDiagnostics role="A" measurement={measurementA} motion={motionA} now={now} />
+            <View style={styles.divider} />
             <RoleDiagnostics role="B" measurement={measurementB} motion={motionB} now={now} />
+            <View style={styles.divider} />
             <DiagnosticRow label="SESSION" value={(ownMeasurement && fresh ? ownMeasurement.sessionState : sessionState ?? 'idle').toUpperCase()} />
             <DiagnosticRow
               label="BEARINGS"
@@ -762,12 +761,11 @@ export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void
                 ? `${capabilities.uwbSupported ? 'UWB' : 'NO UWB'} · ${capabilities.directionMayBeAvailable ? 'DIRECTION' : 'NO DIRECTION'} · ${capabilities.deviceMotionAvailable ? 'MOTION' : 'NO MOTION'} · ${capabilities.magneticNorthAvailable ? 'MAGNETIC' : 'NO MAGNETIC'}`
                 : 'LOADING'}
             />
-          </View>
+          </HudFrame>
 
-          <Text style={styles.label}>EVENT LOG</Text>
-          <View style={styles.diagnostics}>
-            {logs.map((log, index) => <Text style={styles.log} key={`${log}-${index}`}>{log}</Text>)}
-          </View>
+          <HudFrame title="EVENT LOG" tag={`${logs.length} LINES`}>
+            {logs.map((log, index) => <Text style={[styles.log, index === 0 && styles.logLatest]} key={`${log}-${index}`}>{`> ${log}`}</Text>)}
+          </HudFrame>
         </ScrollView>
       </SafeAreaView>
       {joinOpen && <JoinOverlay role={localRole} note={joinNote} status={joinStatus} onSwipe={handleSwipe} onClose={() => setJoinOpen(false)} camera={camera} />}
@@ -776,101 +774,79 @@ export default function SpatialLab({ onExit, onOpenSwipe }: { onExit: () => void
   );
 }
 
+const CAMERA_THEME = { text: HUD.text, muted: HUD.muted, accent: HUD.faint, border: HUD.lineStrong, button: 'rgba(255, 79, 216, 0.12)', buttonText: HUD.magenta, buttonBorder: HUD.magenta, fontFamily: HUD_FONT };
+
+const mono = { fontFamily: HUD_FONT } as const;
+
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#0b0d10' },
-  safe: { flex: 1, backgroundColor: '#0b0d10' },
-  container: { padding: 22, gap: 16 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingTop: 10 },
-  exitButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingRight: 12 },
-  exitButtonText: { color: '#80aaff', fontSize: 14, fontWeight: '700' },
-  swipeButton: { alignSelf: 'flex-start', backgroundColor: '#263b59', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 13 },
-  swipeButtonText: { color: '#cfe2ff', fontSize: 12, fontWeight: '800' },
-  eyebrow: { color: '#80aaff', fontSize: 10, fontWeight: '800', letterSpacing: 1.5 },
-  title: { color: '#f4f6f8', fontSize: 30, fontWeight: '800', letterSpacing: -0.8, marginTop: 6 },
-  subtitle: { color: '#8993a1', fontSize: 13, marginTop: 5, maxWidth: 280 },
-  statusDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#69717c', marginTop: 10 },
-  statusDotConnected: { backgroundColor: '#7fe0a1' },
-  visualPanel: { backgroundColor: '#14181e', borderRadius: 24, padding: 12, borderWidth: 1, borderColor: '#242b34' },
+  root: { flex: 1, backgroundColor: HUD.background },
+  safe: { flex: 1 },
+  container: { padding: 20, gap: 18, paddingBottom: 40 },
+  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingTop: 6 },
+  headerText: { flex: 1 },
+  eyebrow: { ...mono, color: HUD.cyan, fontSize: 9, fontWeight: '800', letterSpacing: 1.5 },
+  title: { ...mono, color: HUD.text, fontSize: 30, fontWeight: '800', lineHeight: 36, marginTop: 10, ...glow(HUD.cyan, 14) },
+  subtitle: { color: HUD.muted, fontSize: 13, marginTop: 8, maxWidth: 280 },
+  linkBadge: { alignItems: 'center', gap: 2 },
+  linkBadgeText: { ...mono, color: HUD.faint, fontSize: 8, fontWeight: '800', letterSpacing: 1.5 },
   scene: { width: SCENE_WIDTH, height: SCENE_HEIGHT, alignSelf: 'center', position: 'relative', overflow: 'hidden' },
-  axisHorizontal: { position: 'absolute', left: 14, right: 14, top: ORIGIN_Y, height: 1, backgroundColor: 'rgba(126, 155, 194, 0.20)' },
-  axisVertical: { position: 'absolute', top: 16, bottom: 30, left: ORIGIN_X, width: 1, backgroundColor: 'rgba(126, 155, 194, 0.20)' },
-  axisLabel: { position: 'absolute', backgroundColor: '#1a222c', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4 },
+  rangeRing: { position: 'absolute', borderWidth: 1, borderColor: 'rgba(63, 246, 255, 0.10)' },
+  sweep: { position: 'absolute', left: ORIGIN_X, top: ORIGIN_Y, width: SCENE_REACH_PX + 20, height: 1, backgroundColor: 'rgba(63, 246, 255, 0.35)', transformOrigin: 'left center', shadowColor: HUD.cyan, shadowOpacity: 1, shadowRadius: 6, shadowOffset: { width: 0, height: 0 } },
+  axisHorizontal: { position: 'absolute', left: 14, right: 14, top: ORIGIN_Y, height: 1, backgroundColor: 'rgba(63, 246, 255, 0.22)' },
+  axisVertical: { position: 'absolute', top: 16, bottom: 30, left: ORIGIN_X, width: 1, backgroundColor: 'rgba(63, 246, 255, 0.22)' },
+  axisLabel: { position: 'absolute', borderWidth: 1, borderColor: HUD.lineStrong, backgroundColor: HUD.panelSolid, paddingHorizontal: 5, paddingVertical: 2, borderRadius: 2 },
   axisLabelX: { right: 14, top: ORIGIN_Y + 6 },
   axisLabelY: { left: ORIGIN_X + 6, top: 16 },
-  axisText: { color: '#6f849d', fontSize: 9, fontWeight: '800' },
-  measurementVector: { position: 'absolute', height: 1, backgroundColor: 'rgba(240, 113, 125, 0.75)', transformOrigin: 'left center' },
-  measurementVectorEstimated: { backgroundColor: 'rgba(240, 179, 111, 0.75)' },
+  axisText: { ...mono, color: HUD.cyan, fontSize: 9, fontWeight: '800' },
+  measurementVector: { position: 'absolute', height: 1, backgroundColor: HUD.magenta, transformOrigin: 'left center', shadowColor: HUD.magenta, shadowOpacity: 1, shadowRadius: 4, shadowOffset: { width: 0, height: 0 } },
+  measurementVectorEstimated: { backgroundColor: HUD.warn, shadowColor: HUD.warn },
   phoneAnchor: { position: 'absolute' },
-  phone: { width: 52, height: 82, borderRadius: 11, borderWidth: 2, borderColor: '#b6d1f5', backgroundColor: '#1d385d', padding: 5, alignItems: 'center', shadowColor: '#76a9ef', shadowOpacity: 0.35, shadowRadius: 12, shadowOffset: { width: 0, height: 0 } },
-  phoneRed: { borderColor: '#f2a0a0', backgroundColor: '#642d36', shadowColor: '#ef6d78' },
-  phoneEstimated: { opacity: 0.65, borderStyle: 'dashed' },
-  phoneSpeaker: { width: 15, height: 2, borderRadius: 2, backgroundColor: '#9fc4f3', marginBottom: 4 },
-  phoneSpeakerRed: { backgroundColor: '#ffc0c0' },
-  phoneScreen: { flex: 1, width: '100%', borderRadius: 5, backgroundColor: '#0c1728', overflow: 'hidden', alignItems: 'center', justifyContent: 'center' },
+  phone: { width: 52, height: 82, borderRadius: 11, borderWidth: 1.5, borderColor: HUD.cyan, backgroundColor: 'rgba(63, 246, 255, 0.10)', padding: 5, alignItems: 'center', shadowColor: HUD.cyan, shadowOpacity: 0.8, shadowRadius: 12, shadowOffset: { width: 0, height: 0 } },
+  phoneRed: { borderColor: HUD.magenta, backgroundColor: 'rgba(255, 79, 216, 0.10)', shadowColor: HUD.magenta },
+  phoneEstimated: { opacity: 0.6, borderStyle: 'dashed' },
+  phoneSpeaker: { width: 15, height: 2, borderRadius: 2, backgroundColor: HUD.cyan, marginBottom: 4 },
+  phoneSpeakerRed: { backgroundColor: HUD.magenta },
+  phoneScreen: { flex: 1, width: '100%', borderRadius: 5, backgroundColor: 'rgba(2, 5, 11, 0.85)', overflow: 'hidden', alignItems: 'center', justifyContent: 'center' },
   phoneScreenCompact: { borderRadius: 1 },
-  phoneLetter: { color: '#d6e6ff', fontWeight: '800' },
-  phoneLetterRed: { color: '#ffd6d6' },
-  phoneGlow: { width: 24, height: 24, borderRadius: 12, backgroundColor: 'rgba(117, 175, 251, 0.38)' },
-  phoneGlowRed: { backgroundColor: 'rgba(255, 133, 145, 0.48)' },
-  phoneHome: { width: 10, height: 2, borderRadius: 2, backgroundColor: '#9fc4f3', marginTop: 4 },
-  phoneHomeRed: { backgroundColor: '#ffc0c0' },
-  unknownPosition: { position: 'absolute', left: 90, right: 90, top: 24, alignItems: 'center', padding: 16, borderWidth: 1, borderStyle: 'dashed', borderColor: '#7b5a42', borderRadius: 16, backgroundColor: 'rgba(88, 58, 40, 0.22)' },
-  unknownGlyph: { color: '#f0b36f', fontSize: 28, fontWeight: '800' },
-  unknownTitle: { color: '#f0b36f', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginTop: 4 },
-  unknownReason: { color: '#a88d76', fontSize: 10, marginTop: 4, textAlign: 'center' },
+  phoneLetter: { ...mono, color: HUD.cyan, fontWeight: '800', ...glow(HUD.cyan, 8) },
+  phoneLetterRed: { color: HUD.magenta, ...glow(HUD.magenta, 8) },
+  phoneGlow: { width: 24, height: 24, borderRadius: 12, backgroundColor: 'rgba(63, 246, 255, 0.35)' },
+  phoneGlowRed: { backgroundColor: 'rgba(255, 79, 216, 0.4)' },
+  phoneHome: { width: 10, height: 2, borderRadius: 2, backgroundColor: HUD.cyan, marginTop: 4 },
+  phoneHomeRed: { backgroundColor: HUD.magenta },
+  unknownPosition: { position: 'absolute', left: 80, right: 80, top: 24, alignItems: 'center', padding: 14, borderWidth: 1, borderStyle: 'dashed', borderColor: 'rgba(255, 194, 77, 0.6)', borderRadius: 3, backgroundColor: 'rgba(255, 194, 77, 0.07)' },
+  unknownGlyph: { ...mono, color: HUD.warn, fontSize: 26, fontWeight: '800', ...glow(HUD.warn, 10) },
+  unknownTitle: { ...mono, color: HUD.warn, fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginTop: 4 },
+  unknownReason: { ...mono, color: 'rgba(255, 194, 77, 0.7)', fontSize: 9, marginTop: 4, textAlign: 'center' },
   sceneFooter: { position: 'absolute', bottom: 6, left: 0, right: 0, alignItems: 'center' },
-  sceneFooterText: { color: '#7e8c9d', fontSize: 11, fontWeight: '700' },
-  sceneScaleText: { color: '#56657a', fontSize: 9, fontWeight: '700', marginTop: 3 },
-  viewButton: { alignSelf: 'center', paddingVertical: 8, paddingHorizontal: 12, marginBottom: 4 },
-  viewButtonText: { color: '#80aaff', fontSize: 12, fontWeight: '700' },
-  viewButtonTextDisabled: { color: '#35404d' },
-  measurementRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', paddingHorizontal: 12, paddingBottom: 10 },
-  measurementLabel: { color: '#778391', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
-  measurement: { color: '#f5f7fa', fontSize: 42, fontWeight: '800', letterSpacing: -1.5, marginTop: 4 },
+  sceneFooterText: { ...mono, color: HUD.muted, fontSize: 10, fontWeight: '700' },
+  sceneScaleText: { ...mono, color: HUD.faint, fontSize: 8, fontWeight: '700', marginTop: 3 },
+  measurementRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', paddingHorizontal: 4, paddingBottom: 4 },
+  measurementLabel: { ...mono, color: HUD.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1.5 },
+  measurement: { ...mono, color: HUD.cyan, fontSize: 40, fontWeight: '800', marginTop: 4, ...glow(HUD.cyan, 16) },
   rightMeasurement: { alignItems: 'flex-end', paddingBottom: 5 },
-  rawValue: { color: '#a9b6c7', fontSize: 16, fontWeight: '700', marginTop: 5 },
-  statusPanel: { backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 13, gap: 8 },
-  gamePanel: { backgroundColor: '#211d16', borderRadius: 20, borderWidth: 1, borderColor: '#705733', padding: 16, gap: 12 },
-  gameHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  gameEyebrow: { color: '#f0b36f', fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
-  gameTitle: { color: '#fff1d6', fontSize: 24, fontWeight: '900', marginTop: 4 },
-  scoreBadge: { alignItems: 'center', backgroundColor: '#342918', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8 },
-  scoreText: { color: '#f0b36f', fontSize: 24, fontWeight: '900' },
-  scoreLabel: { color: '#a88d76', fontSize: 8, fontWeight: '900', letterSpacing: 1 },
-  gameHint: { color: '#c4aa83', fontSize: 13, lineHeight: 18 },
-  gameButton: { backgroundColor: '#f0b36f', borderRadius: 13, alignItems: 'center', paddingVertical: 14 },
-  gameButtonText: { color: '#241b12', fontWeight: '900' },
+  rawValue: { ...mono, color: HUD.text, fontSize: 16, fontWeight: '700', marginTop: 5 },
   diagnosticRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
-  diagnosticLabel: { color: '#778391', fontSize: 10, fontWeight: '800', letterSpacing: 1.1 },
-  diagnosticValue: { color: '#d8e0ea', fontSize: 11, fontWeight: '700', textAlign: 'right', flexShrink: 1 },
-  goodText: { color: '#7fe0a1' },
-  warnText: { color: '#f0b36f' },
-  connectionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 3 },
-  label: { color: '#778391', fontSize: 10, fontWeight: '800', letterSpacing: 1.4 },
-  connectionValue: { color: '#e7edf5', fontSize: 16, fontWeight: '800', marginTop: 5 },
-  peerCount: { color: '#778391', fontSize: 12 },
-  peerList: { gap: 10 },
-  peerRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 12 },
-  peerIcon: { width: 52, height: 82, alignItems: 'center', justifyContent: 'center', transform: [{ scale: 0.66 }] },
+  diagnosticLabel: { ...mono, color: HUD.muted, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
+  diagnosticValue: { ...mono, color: HUD.text, fontSize: 10, fontWeight: '700', textAlign: 'right', flexShrink: 1 },
+  goodText: { color: HUD.good, ...glow(HUD.good, 6) },
+  warnText: { color: HUD.warn },
+  divider: { height: StyleSheet.hairlineWidth, backgroundColor: HUD.line, marginVertical: 2 },
+  connectionValue: { ...mono, color: HUD.text, fontSize: 15, fontWeight: '800', letterSpacing: 1 },
+  peerRow: { flexDirection: 'row', alignItems: 'center', borderRadius: 3, borderWidth: 1, borderColor: 'rgba(255, 79, 216, 0.35)', backgroundColor: 'rgba(255, 79, 216, 0.05)', padding: 10 },
+  peerIcon: { width: 52, height: 82, alignItems: 'center', justifyContent: 'center', transform: [{ scale: 0.6 }] },
   peerInfo: { flex: 1, marginLeft: 4 },
-  peerName: { color: '#e7edf5', fontSize: 15, fontWeight: '700' },
-  peerId: { color: '#778391', fontSize: 11, marginTop: 3 },
-  connectAction: { color: '#80aaff', fontSize: 10, fontWeight: '800', letterSpacing: 1 },
-  actions: { flexDirection: 'row', gap: 10 },
-  primary: { flex: 1, backgroundColor: '#80aaff', paddingVertical: 16, borderRadius: 14, alignItems: 'center' },
-  primaryDisabled: { backgroundColor: '#2b3542' },
-  primaryText: { color: '#0b0d10', fontWeight: '800' },
-  secondary: { paddingHorizontal: 16, paddingVertical: 16, borderRadius: 14, borderWidth: 1, borderColor: '#35404d', alignItems: 'center' },
-  secondaryText: { color: '#e7edf5', fontWeight: '700' },
-  joinPanel: { backgroundColor: '#14181e', borderRadius: 16, borderWidth: 1, borderColor: '#242b34', padding: 13, gap: 10 },
-  joinPanelHint: { color: '#8993a1', fontSize: 12, lineHeight: 17 },
-  joinButton: { borderRadius: 14, borderWidth: 1, borderColor: '#80aaff', paddingVertical: 14, alignItems: 'center' },
-  joinButtonDisabled: { borderColor: '#35404d' },
-  joinButtonText: { color: '#80aaff', fontWeight: '800' },
+  peerName: { ...mono, color: HUD.text, fontSize: 14, fontWeight: '700' },
+  peerId: { ...mono, color: HUD.faint, fontSize: 9, marginTop: 3 },
+  connectAction: { ...mono, color: HUD.magenta, fontSize: 10, fontWeight: '800', letterSpacing: 1.5, ...glow(HUD.magenta, 6) },
+  actions: { flexDirection: 'row', gap: 10, marginTop: 4 },
+  primary: { flex: 1 },
+  joinPanelHint: { color: HUD.muted, fontSize: 12, lineHeight: 17 },
   linkLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   linkRing: { position: 'absolute', width: LINK_RING_SIZE, height: LINK_RING_SIZE, borderRadius: LINK_RING_SIZE / 2, borderWidth: 2 },
   linkBeam: { position: 'absolute', height: 4, borderRadius: 2, transformOrigin: 'left center', shadowOpacity: 0.9, shadowRadius: 10, shadowOffset: { width: 0, height: 0 } },
-  linkHead: { position: 'absolute', left: 0, top: 0, width: LINK_HEAD_SIZE, height: LINK_HEAD_SIZE, borderRadius: LINK_HEAD_SIZE / 2, backgroundColor: '#f4f8ff', shadowOpacity: 1, shadowRadius: 16, shadowOffset: { width: 0, height: 0 } },
-  diagnostics: { backgroundColor: '#101318', borderRadius: 14, borderWidth: 1, borderColor: '#202731', padding: 12, gap: 7 },
-  log: { color: '#9eabb9', fontSize: 11, fontFamily: 'monospace', lineHeight: 16 },
+  linkHead: { position: 'absolute', left: 0, top: 0, width: LINK_HEAD_SIZE, height: LINK_HEAD_SIZE, borderRadius: LINK_HEAD_SIZE / 2, backgroundColor: '#f4feff', shadowOpacity: 1, shadowRadius: 16, shadowOffset: { width: 0, height: 0 } },
+  log: { ...mono, color: HUD.muted, fontSize: 10, lineHeight: 15 },
+  logLatest: { color: HUD.good },
 });

@@ -16,8 +16,8 @@ import {
   rollStarterTraits,
 } from '../game/Simulation';
 import { SimulationDriver } from '../game/SimulationDriver';
-import { playEvents } from '../game/sound';
-import { Bug, DeathCause, PowerId, SimulationEvent, SimulationState, TraitSet } from '../game/types';
+import { playAmbient, playEvents, playSound } from '../game/sound';
+import { Biome, Bug, DeathCause, SimulationEvent, SimulationState, TraitSet } from '../game/types';
 
 /** About 30 redraws a second; the simulation itself steps at its own fixed rate. */
 const RENDER_INTERVAL_MS = 33;
@@ -35,7 +35,7 @@ export type Ecosystem = {
   running: boolean;
   log: LogEntry[];
   obituaries: Record<string, Obituary>;
-  release: (starters: [TraitSet], power: PowerId) => void;
+  release: (starters: [TraitSet], biome: Biome) => void;
   restart: () => void;
   setPaused: (paused: boolean) => void;
   toggleSound: () => void;
@@ -88,7 +88,7 @@ export function useEcosystem(visible: boolean): Ecosystem {
         entries.push({ text: event.survivors === 1 ? 'One bug left: the ecosystem has ended' : 'No bugs left: the ecosystem has ended', tone: 'info' });
       }
     }
-    if (driverRef.current?.state) playEvents(events, driverRef.current.state.soundEnabled, driverRef.current.state.arena.biome);
+    if (driverRef.current?.state) playEvents(events, driverRef.current.state.soundEnabled);
     addLog(entries);
   }, [addLog]);
 
@@ -136,6 +136,7 @@ export function useEcosystem(visible: boolean): Ecosystem {
         const events = driver.advance(lastMs == null ? 0 : (nowMs - lastMs) / 1000);
         lastMs = nowMs;
         if (events.length > 0) record(events);
+        else if (driver.running) playAmbient(driver.state.arena.biome, driver.state.soundEnabled);
         if ((driver.running && nowMs - lastRenderMs >= RENDER_INTERVAL_MS) || events.some((event) => event.type === 'ecosystem-ended')) {
           lastRenderMs = nowMs;
           refresh();
@@ -162,6 +163,7 @@ export function useEcosystem(visible: boolean): Ecosystem {
     admitBug(driver.state, bug, landing, landing.heading);
     driver.saveNow();
     addLog([{ text: `${bug.name} arrived from the other phone`, tone: 'travel' }]);
+    void playSound('arrived', driver.state.soundEnabled);
     refresh();
     return true;
   }, [addLog, refresh]);
@@ -176,6 +178,7 @@ export function useEcosystem(visible: boolean): Ecosystem {
     admitBug(driver.state, bug, at, heading + Math.PI);
     driver.saveNow();
     addLog([{ text: `${bug.name} turned back`, tone: 'travel' }]);
+    void playSound('arrived', driver.state.soundEnabled);
     refresh();
     return true;
   }, [addLog, refresh]);
@@ -196,12 +199,13 @@ export function useEcosystem(visible: boolean): Ecosystem {
     running: driverRef.current?.running ?? false,
     log,
     obituaries: obituaries.current,
-    release: (starters, power) => withDriver((driver) => {
-      releaseStarters(driver.state, starters, power);
+    release: (starters, biome) => withDriver((driver) => {
+      releaseStarters(driver.state, starters, { biome });
       driver.saveNow();
       obituaries.current = {};
       setLog([]);
       addLog([{ text: 'Starters released into the habitat', tone: 'info' }]);
+      void playSound('release', driver.state.soundEnabled);
     }),
     restart: () => withDriver((driver) => {
       restartEcosystem(driver.state);
@@ -210,7 +214,11 @@ export function useEcosystem(visible: boolean): Ecosystem {
       setLog([]);
     }),
     setPaused: (paused) => withDriver((driver) => driver.setPaused(paused)),
-    toggleSound: () => withDriver((driver) => { driver.state.soundEnabled = !driver.state.soundEnabled; driver.saveNow(); }),
+    toggleSound: () => withDriver((driver) => {
+      driver.state.soundEnabled = !driver.state.soundEnabled;
+      driver.saveNow();
+      void playSound('sound-on', driver.state.soundEnabled);
+    }),
     rollStarters: () => driverRef.current ? rollStarterTraits(driverRef.current.state) : defaultStarterTraits(),
     setCrossing,
     admit,

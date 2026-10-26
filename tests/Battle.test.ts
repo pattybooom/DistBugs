@@ -5,7 +5,7 @@ test('battle arenas are deterministic and release one owned starter', () => {
   const a = createSimulation(42);
   const b = createSimulation(42);
   expect(a.arena).toEqual(b.arena);
-  releaseStarters(a, [defaultTraits()], 'shield');
+  releaseStarters(a, [defaultTraits()], { power: 'shield' });
   expect(a.mode).toBe('ecosystem');
   expect(a.bugs).toHaveLength(10);
   expect(a.bugs[0].owner).toBe('local');
@@ -44,4 +44,13 @@ test('battle offspring mutate: a child can differ from its parent, and stays wit
     if (JSON.stringify(child.traits) !== JSON.stringify(parent.traits)) changed += 1;
   }
   expect(changed).toBeGreaterThan(0);
+});
+
+test('a chosen biome rebuilds the arena, and starters are dealt a power without being asked for one', () => {
+  const state = createSimulation(42);
+  const biome = state.arena.biome === 'desert' ? 'swamp' : 'desert';
+  releaseStarters(state, [defaultTraits()], { biome });
+  expect(state.arena.biome).toBe(biome);
+  expect(state.bugs[0].power).not.toBeNull();
+  expect(state.bugs.filter((bug) => bug.owner === 'wild').every((bug) => bug.power === null)).toBe(true);
 });

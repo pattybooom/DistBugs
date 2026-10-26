@@ -112,6 +112,8 @@ public final class ParallaxModule: Module {
     AsyncFunction("stopRanging") { [weak self] in self?.stopRanging() }
     AsyncFunction("getCapabilities") { [weak self] in self?.capabilities() ?? [:] }
     AsyncFunction("sendPeerMessage") { [weak self] (message: String) in try self?.sendPeerMessage(message) }
+    AsyncFunction("startMotion") { [weak self] in self?.startMotionUpdates() }
+    AsyncFunction("stopMotion") { [weak self] in self?.stopMotionIfIdle() }
   }
 
   private func sendPeerMessage(_ message: String) throws {
@@ -428,6 +430,11 @@ public final class ParallaxModule: Module {
     if let frame = motionReferenceFrame { motionManager.startDeviceMotionUpdates(using: frame, to: .main, withHandler: handler) }
     else { motionManager.startDeviceMotionUpdates(to: .main, withHandler: handler) }
     diagnostic("motion", "Started device motion with \(motionReferenceFrameName); magneticNorth=\(magneticNorthAvailable)")
+  }
+
+  /// Swipe senses movement without a peer, so leaving it must not stop motion a connected link still needs.
+  private func stopMotionIfIdle() {
+    if session?.connectedPeers.isEmpty ?? true { stopMotionUpdates() }
   }
 
   private func stopMotionUpdates() {

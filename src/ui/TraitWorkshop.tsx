@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { BIOMES } from '../game/arena';
 import { defaultStarterTraits } from '../game/Simulation';
 import { PALETTES } from '../game/sprites';
 import { adjustBehaviour, BEHAVIOUR_KEYS, BEHAVIOUR_SPECS, BehaviourKey, cycleVisual, VisualOptionKey } from '../game/traits';
-import { PowerId, TraitSet } from '../game/types';
+import { Biome, TraitSet } from '../game/types';
 import { BugSprite } from './BugSprite';
 import { COLORS, PIXEL_FONT } from './theme';
 
@@ -56,17 +57,31 @@ function RangeBar({ share }: { share: number }) {
   );
 }
 
+const BIOME_HINTS: Record<Biome, string> = {
+  meadow: 'A couple of ponds and open grass',
+  swamp: 'Boggy, with extra hazards',
+  desert: 'One small oasis and lots of open sand',
+  tidepool: 'Dotted with small pools',
+};
+
+/** A different biome from `current`, so Randomise always visibly changes it. */
+const rollBiome = (current: Biome): Biome => {
+  const others = BIOMES.filter((biome) => biome !== current);
+  return others[Math.floor(Math.random() * others.length)];
+};
+
 const visualValue = (traits: TraitSet, key: VisualOptionKey | 'palette') =>
   key === 'palette' ? PALETTES[traits.visual.palette].name : traits.visual[key];
 
-export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }: {
+export function TraitWorkshop({ ecosystemNumber, initialBiome, onRelease, onRoll, onOpenLab }: {
   ecosystemNumber: number;
-  onRelease: (starters: [TraitSet], power: PowerId) => void;
+  initialBiome: Biome;
+  onRelease: (starters: [TraitSet], biome: Biome) => void;
   onRoll: () => [TraitSet, TraitSet];
   onOpenLab: () => void;
 }) {
   const [starter, setStarter] = useState<TraitSet>(defaultStarterTraits()[0]);
-  const [power, setPower] = useState<PowerId>('dash');
+  const [biome, setBiome] = useState<Biome>(initialBiome);
   const traits = starter;
   const update = (next: TraitSet) => setStarter(next);
 
@@ -77,7 +92,7 @@ export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }:
           <View style={styles.headerText}>
             <Text style={styles.eyebrow}>ECOSYSTEM #{ecosystemNumber} · WORKSHOP</Text>
             <Text style={styles.title}>Build your battle bug</Text>
-            <Text style={styles.subtitle}>Choose one starter and one signature power. Your bug fights autonomously inside a generated arena.</Text>
+            <Text style={styles.subtitle}>Design one starter and pick its arena. Your bug gets a random signature power and fights autonomously.</Text>
           </View>
           <TouchableOpacity onPress={onOpenLab} hitSlop={8}>
             <Text style={styles.labLink}>Spatial Lab</Text>
@@ -88,12 +103,6 @@ export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }:
 
         <View style={styles.preview}>
           <BugSprite visual={traits.visual} pixel={9} />
-        </View>
-
-        <View style={styles.panel}>
-          <Text style={styles.sectionLabel}>SIGNATURE POWER</Text>
-          {(['dash', 'shield', 'stun-pulse', 'regeneration', 'frenzy'] as PowerId[]).map((id) => <TouchableOpacity key={id} style={[styles.power, power === id && styles.powerSelected]} onPress={() => setPower(id)}><Text style={styles.powerText}>{id.replace('-', ' ').toUpperCase()}</Text></TouchableOpacity>)}
-          <Text style={styles.hint}>Aggression: higher values engage sooner, hit harder, and resist retreating; they also increase energy use and risk.</Text>
         </View>
 
         <View style={styles.panel}>
@@ -131,11 +140,21 @@ export function TraitWorkshop({ ecosystemNumber, onRelease, onRoll, onOpenLab }:
           })}
         </View>
 
+        <View style={styles.panel}>
+          <Text style={styles.sectionLabel}>BIOME</Text>
+          {BIOMES.map((id) => (
+            <TouchableOpacity key={id} style={[styles.biome, biome === id && styles.biomeSelected]} onPress={() => setBiome(id)}>
+              <Text style={styles.biomeText}>{id.toUpperCase()}</Text>
+              <Text style={styles.hint}>{BIOME_HINTS[id]}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
         <View style={styles.actions}>
-          <TouchableOpacity style={styles.secondary} onPress={() => setStarter(onRoll()[0])}>
+          <TouchableOpacity style={styles.secondary} onPress={() => { setStarter(onRoll()[0]); setBiome(rollBiome(biome)); }}>
             <Text style={styles.secondaryText}>Randomise</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.primary} onPress={() => onRelease([starter], power)}>
+          <TouchableOpacity style={styles.primary} onPress={() => onRelease([starter], biome)}>
             <Text style={styles.primaryText}>Start battle</Text>
           </TouchableOpacity>
         </View>
@@ -176,7 +195,7 @@ const styles = StyleSheet.create({
   primaryText: { color: '#241b12', fontWeight: '900' },
   secondary: { paddingHorizontal: 18, paddingVertical: 16, borderRadius: 14, borderWidth: 1, borderColor: COLORS.panelBorder, alignItems: 'center' },
   secondaryText: { color: COLORS.text, fontWeight: '700' },
-  power: { padding: 10, borderRadius: 10, backgroundColor: COLORS.soil },
-  powerSelected: { borderWidth: 2, borderColor: COLORS.accent },
-  powerText: { color: COLORS.text, fontWeight: '800', fontSize: 12 },
+  biome: { padding: 10, gap: 2, borderRadius: 10, borderWidth: 2, borderColor: 'transparent', backgroundColor: COLORS.soil },
+  biomeSelected: { borderColor: COLORS.accent },
+  biomeText: { color: COLORS.text, fontWeight: '800', fontSize: 12 },
 });

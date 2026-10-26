@@ -2,7 +2,7 @@ import { isSolidAt } from './hexmap';
 import { Random } from './Random';
 import { Arena, Biome, Habitat } from './types';
 
-const BIOMES = ['meadow', 'swamp', 'desert', 'tidepool'] as const;
+export const BIOMES = ['meadow', 'swamp', 'desert', 'tidepool'] as const satisfies readonly Biome[];
 /** A desert has one oasis, a meadow a couple of ponds, a swamp is boggy and a tidepool is mostly small pools. */
 const WATER: Record<Biome, { pools: number; minRadius: number; maxRadius: number }> = {
   meadow: { pools: 2, minRadius: 22, maxRadius: 38 },
@@ -13,9 +13,11 @@ const WATER: Record<Biome, { pools: number; minRadius: number; maxRadius: number
 /** Habitat units a starter needs around it, so it can walk away from its spawn. */
 const SPAWN_CLEARANCE = 12;
 
-export function generateArena(seed: number, habitat: Habitat): Arena {
+/** `biome` overrides the seed's own pick; the rest of the layout still comes from the seed. */
+export function generateArena(seed: number, habitat: Habitat, chosen?: Biome): Arena {
   const rng = new Random(seed ^ 0xa51ced);
-  const biome = rng.pick(BIOMES);
+  const rolled = rng.pick(BIOMES);
+  const biome = chosen ?? rolled;
   const { pools, minRadius, maxRadius } = WATER[biome];
   const water = Array.from({ length: pools }, () => ({ x: rng.range(50, habitat.width - 50), y: rng.range(90, habitat.height - 70), radius: rng.range(minRadius, maxRadius), kind: 'water' as const }));
   const hazards = Array.from({ length: biome === 'swamp' ? 4 : 2 }, () => ({ x: rng.range(35, habitat.width - 35), y: rng.range(70, habitat.height - 35), radius: rng.range(8, 16), kind: 'hazard' as const }));

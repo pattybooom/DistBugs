@@ -20,6 +20,9 @@ test('rejects malformed pose and marker packets at the camera boundary', () => {
     { ...frame(), phones: [frame().phones[0], frame().phones[0]] },
     { ...frame(), screenMarkers: [{ ...frame().screenMarkers[0], cells: [[1]] }, frame().screenMarkers[1]] },
     { ...frame(), media: { kind: 'image', url: 'file:///secret', width: 1, height: 1, version: 1 } },
+    { ...frame(), markerRevisions: { A: -1 } },
+    { ...frame(), markerRevisions: { C: 1 } },
+    { ...frame(), needsPositionUpdate: 'yes' },
   ]) expect(parseSwipeMessage(JSON.stringify(bad))).toBeNull();
 });
 
@@ -53,5 +56,12 @@ test('reconnect resets sequence state and old packets cannot advance the viewpor
     instances[1].onmessage?.({ data: JSON.stringify({ ...frame(), sessionId: 'new', sequence: 1 }) });
     expect(receive).toHaveBeenCalledTimes(2);
     expect(first.close).toHaveBeenCalled();
+    client.connect('ws://localhost:8765', 'A', .46, true);
+    const moving = instances[2];
+    moving.onopen?.();
+    expect(JSON.parse(moving.send.mock.calls[0][0])).toMatchObject({ markerVisibility: 'motion' });
+    client.updateMarkerTracking({ motionAvailable: true, moving: false, markerVisible: false, revision: 1 });
+    expect(JSON.parse(moving.send.mock.calls.at(-1)![0])).toMatchObject({ type: 'heartbeat',
+      markerTracking: { motionAvailable: true, moving: false, markerVisible: false, revision: 1 } });
   } finally { client.close(); globalThis.WebSocket = original; jest.useRealTimers(); }
 });

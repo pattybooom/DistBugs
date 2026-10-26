@@ -16,6 +16,7 @@ from websockets.asyncio.client import connect
 
 import camera_join as app
 from geometry import StabilityGate, phone_pose, polygon_gap, project, rectangle
+from smoothing import PoseSmoother
 
 CONFIG = app.load_config(app.ROOT / 'config.example.json')
 # Deliberately oblique projective camera, world/table y points up.
@@ -30,6 +31,15 @@ def pose(role='A', centre=(10, 10), heading=math.pi/2):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_mirror_preview_keeps_world_coordinates_and_input_unchanged(self):
+        image = np.arange(24, dtype=np.uint8).reshape(4, 6)
+        corners = np.array([[1., 1.], [3, 1], [3, 2], [1, 2]])
+        original = corners.copy()
+        view, markers, matrix = app.preview_geometry(image, {0: corners}, np.eye(3))
+        np.testing.assert_array_equal(view, image[:, ::-1])
+        np.testing.assert_allclose(project(markers[0], matrix), original)
+        np.testing.assert_array_equal(corners, original)
+
     def test_perspective_and_rotation(self):
         for angle in (0, math.pi/2, math.pi, -1.12):
             p = pose(heading=angle)
@@ -109,6 +119,106 @@ class GeometryTests(unittest.TestCase):
         image = np.full((400, 400), 255, np.uint8)
         image[100:220, 100:220] = cv2.aruco.generateImageMarker(app.dictionary(), 0, 120)
         self.assertIn(0, app.detect(image, app.detector()))
+
+    def test_detector_ignores_unconfigured_marker_ids_when_requested(self):
+        image = np.full((400, 600), 255, np.uint8)
+        for marker_id, x in ((0, 80), (2, 300)):
+            image[100:220, x:x+120] = cv2.aruco.generateImageMarker(app.dictionary(), marker_id, 120)
+        self.assertEqual(set(app.detect(image, app.detector(), allowed_ids={0})), {0})
+
+    def test_readable_id_still_needs_contrast_and_an_intact_border(self):
+        corners = np.float32([[40, 40], [159, 40], [159, 159], [40, 159]])
+        image = np.full((200, 200), 180, np.uint8)
+        marker = cv2.aruco.generateImageMarker(app.dictionary(), 0, 120)
+        image[40:160, 40:160] = marker
+        self.assertTrue(app.marker_image_valid(image, corners, 0))
+        self.assertFalse(app.marker_image_valid(image, corners, 1))
+        dim = (image.astype(float) * .05 + 100).astype(np.uint8)
+        self.assertFalse(app.marker_image_valid(dim, corners, 0))
+        image[40:60, 40:160] = 255
+        self.assertFalse(app.marker_image_valid(image, corners, 0))
+
+    def test_confirmation_rejects_single_frame_jump_and_never_replays_a_missing_marker(self):
+        tracker = app.MarkerConfirmation()
+        corners = np.float32([[0, 0], [50, 0], [50, 50], [0, 50]])
+        self.assertFalse(tracker.observe({0: corners}, 0))
+        self.assertFalse(tracker.observe({0: corners}, .03))
+        self.assertIn(0, tracker.observe({0: corners}, .06))
+        self.assertFalse(tracker.observe({0: corners + 200}, .09))
+        self.assertFalse(tracker.observe({}, .12))
+        self.assertFalse(tracker.observe({0: corners}, 1))
+
+
+class SmoothingTests(unittest.TestCase):
+    @staticmethod
+    def phone(x, y=0, heading=0):
+        return {'role': 'A', 'centreCm': {'x': x, 'y': y}, 'headingRad': heading, 'confidence': .9}
+
+    def test_single_frame_pose_spike_is_rejected(self):
+        smoother = PoseSmoother()
+        smoother.apply([self.phone(0)], 0.0)
+        smoother.apply([self.phone(0)], 0.1)
+        stable = smoother.apply([self.phone(20)], 0.2)[0]
+        self.assertLess(stable['centreCm']['x'], 5)
+        settled = smoother.apply([self.phone(0)], 0.3)[0]
+        self.assertLess(settled['centreCm']['x'], 2)
+
+    def test_real_motion_survives_the_short_median(self):
+        smoother = PoseSmoother()
+        values = [smoother.apply([self.phone(x)], i / 10)[0]['centreCm']['x'] for i, x in enumerate((0, 2, 4, 6, 8))]
+        self.assertGreater(values[-1], values[1])
+
+    def test_heading_spikes_are_removed_across_angle_wrap(self):
+        smoother = PoseSmoother()
+        for i, angle in enumerate((math.pi - .01, -math.pi + .01, 1.0)):
+            result = smoother.apply([self.phone(0, heading=angle)], i / 30)[0]
+        self.assertLess(abs(math.atan2(math.sin(result['headingRad'] - math.pi), math.cos(result['headingRad'] - math.pi))), .03)
+
+    def test_smoothed_screen_outline_matches_smoothed_pose(self):
+        smoother = PoseSmoother()
+        for i in range(5):
+            result = smoother.apply([{**self.phone(i), 'widthCm': 6, 'heightCm': 14}], i / 30)[0]
+        outline = np.array(result['cornersCm'])
+        np.testing.assert_allclose(outline.mean(axis=0), [result['centreCm']['x'], result['centreCm']['y']])
+
+
+class MotionPoseCacheTests(unittest.TestCase):
+    def state(self, role='A'):
+        return {'role': role, 'seen': 0, 'markerVisibility': 'motion',
+                'markerTracking': {'motionAvailable': True, 'moving': False, 'markerVisible': True, 'revision': 0}}
+
+    def test_hidden_pose_requires_live_rest_same_client_and_same_revision(self):
+        cache, state = app.MotionPoseCache(), self.state()
+        phone = {'role': 'A', 'confidence': 1, 'centreCm': {'x': 4, 'y': 5}}
+        cache.resolve([phone], [state], 0)
+        self.assertEqual(cache.resolve([], [state], .1)[0], [])  # occlusion while showing the code
+        state['markerTracking']['markerVisible'] = False
+        held, revisions, roles = cache.resolve([], [state], .2)
+        self.assertEqual((held, revisions, roles), ([phone], {'A': 0}, ['A']))
+        state['markerTracking']['moving'] = True
+        self.assertEqual(cache.resolve([], [state], .3)[0], [])
+        state['markerTracking']['moving'] = False
+        state['markerTracking']['revision'] = 1
+        self.assertEqual(cache.resolve([], [state], .4)[0], [])
+        cache.resolve([phone], [state], .5)
+        self.assertEqual(cache.resolve([], [self.state()], .6)[0], [])  # reconnect
+        cache.resolve([phone], [state], .7)
+        self.assertEqual(cache.resolve([], [state], 1.3)[0], [])  # heartbeat expired
+
+    def test_unavailable_motion_and_legacy_clients_cannot_hold_positions(self):
+        cache, state = app.MotionPoseCache(), self.state()
+        phone = {'role': 'A', 'confidence': 1}
+        cache.resolve([phone], [state], 0)
+        state['markerTracking'].update(markerVisible=False, motionAvailable=False)
+        self.assertEqual(cache.resolve([], [state], .1)[0], [])
+        state.pop('markerVisibility')
+        self.assertEqual(cache.resolve([], [state], .2)[0], [])
+
+    def test_malformed_sensor_state_is_rejected_at_the_network_boundary(self):
+        for value in (None, {}, {'motionAvailable': True, 'moving': False, 'markerVisible': False, 'revision': True},
+                      {'motionAvailable': True, 'moving': False, 'markerVisible': False, 'revision': -1}):
+            with self.assertRaises(ValueError):
+                app.marker_tracking_state(value)
 
 
 class NetworkTests(unittest.IsolatedAsyncioTestCase):

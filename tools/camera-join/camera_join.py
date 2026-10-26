@@ -22,6 +22,7 @@ from smoothing import PoseSmoother
 ROOT = Path(__file__).resolve().parent
 DEBUG_DIR = ROOT / 'debug'
 REFERENCE_IDS = (10, 11, 12, 13)  # top-left, top-right, bottom-right, bottom-left
+MIN_TRACKING_CONFIDENCE = .55
 
 
 def load_config(path):
@@ -72,28 +73,139 @@ def dictionary():
 
 def detector():
     parameters = cv2.aruco.DetectorParameters()
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    # Small on-screen squares are blurry and low-resolution, so search for smaller, softer, noisier markers than the defaults.
-    parameters.minMarkerPerimeterRate = 0.01
-    parameters.adaptiveThreshWinSizeMax = 43
-    parameters.adaptiveThreshWinSizeStep = 8
-    parameters.polygonalApproxAccuracyRate = 0.05
-    parameters.maxErroneousBitsInBorderRate = 0.5
+    # The camera is used for geometry, not just ID recognition. Keep candidate
+    # generation conservative: accepting every tiny square produces plausible
+    # IDs whose corners wander badly after the tabletop homography.
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
+    parameters.minMarkerPerimeterRate = 0.025
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 23
+    parameters.adaptiveThreshWinSizeStep = 4
+    parameters.polygonalApproxAccuracyRate = 0.03
+    parameters.maxErroneousBitsInBorderRate = 0.35
+    parameters.errorCorrectionRate = 0.5
+    parameters.minDistanceToBorder = 4
     parameters.perspectiveRemovePixelPerCell = 8
     return cv2.aruco.ArucoDetector(dictionary(), parameters)
 
 
-def detect(frame, reader, rejected=None):
+def detect(frame, reader, rejected=None, allowed_ids=None):
     corners, ids, rejects = reader.detectMarkers(frame)
     if rejected is not None:
         rejected.extend(candidate.reshape(4, 2) for candidate in rejects)
     result = {}
     if ids is not None:
         for marker, points in zip(ids.flatten(), corners):
+            if allowed_ids is not None and int(marker) not in allowed_ids:
+                continue
             if int(marker) in result:
                 raise ValueError(f"Duplicate marker ID {marker}")
+            if frame is not None and not marker_image_valid(frame, points.reshape(4, 2), int(marker)):
+                if rejected is not None:
+                    rejected.append(points.reshape(4, 2))
+                continue
             result[int(marker)] = points.reshape(4, 2)
     return result
+
+
+def marker_image_valid(frame, corners, marker_id):
+    """Require resolved cells and a visible black border, not just a decoded ID."""
+    if min(np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)) < 22:
+        return False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    transform = cv2.getPerspectiveTransform(corners.astype(np.float32),
+                                           np.float32([[0, 0], [59, 0], [59, 59], [0, 59]]))
+    square = cv2.warpPerspective(gray, transform, (60, 60))
+    cells = np.array([[np.median(square[y*10+3:y*10+7, x*10+3:x*10+7])
+                       for x in range(6)] for y in range(6)])
+    expected = cv2.aruco.generateImageMarker(dictionary(), marker_id, 6) > 0
+    black, white = float(np.median(cells[~expected])), float(np.median(cells[expected]))
+    if white - black < 25:
+        return False
+    bits = cells > (white + black) / 2
+    border = np.ones((6, 6), dtype=bool)
+    border[1:5, 1:5] = False
+    return np.count_nonzero(bits[border]) <= 1 and np.count_nonzero(bits[1:5, 1:5] != expected[1:5, 1:5]) <= 1
+
+
+class MarkerConfirmation:
+    """Confirm new locations across three frames; never invent a missing marker."""
+
+    def __init__(self):
+        self.history = {}
+
+    def reset(self):
+        self.history.clear()
+
+    def observe(self, markers, now):
+        accepted = {}
+        for marker_id, corners in markers.items():
+            previous = self.history.get(marker_id)
+            count = 1
+            if previous is not None:
+                old, last, seen = previous
+                side = min(np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1))
+                if 0 <= now - last <= .35 and np.max(np.linalg.norm(corners - old, axis=1)) < max(12, side * .75):
+                    count = seen + 1
+            self.history[marker_id] = (corners.copy(), now, count)
+            if count >= 3:
+                accepted[marker_id] = corners
+        for marker_id in list(self.history):
+            if now - self.history[marker_id][1] > .35:
+                del self.history[marker_id]
+        return accepted
+
+
+def marker_tracking_state(value):
+    if not isinstance(value, dict) or any(type(value.get(key)) is not bool
+                                          for key in ('motionAvailable', 'moving', 'markerVisible')):
+        raise ValueError('Invalid marker movement state')
+    revision = value.get('revision')
+    if type(revision) is not int or not 0 <= revision <= 9007199254740991:
+        raise ValueError('Invalid marker movement revision')
+    return {key: value[key] for key in ('motionAvailable', 'moving', 'markerVisible', 'revision')}
+
+
+class MotionPoseCache:
+    """Hold confirmed positions only while a live phone explicitly reports rest.
+
+    This is negotiated by the DistBugs game clients. The continuous Swipe demo
+    and older clients must still supply visible markers for every layout.
+    """
+
+    def __init__(self):
+        self.entries = {}
+
+    def reset(self):
+        self.entries.clear()
+
+    def resolve(self, phones, states, now):
+        result = {p['role']: p for p in phones}
+        revisions, held = {}, []
+        for state in states:
+            role = state['role']
+            if state.get('markerVisibility') != 'motion':
+                self.entries.pop(role, None)
+                continue
+            movement = state['markerTracking']
+            entry = self.entries.get(role)
+            if entry and (entry['client'] is not state or entry['revision'] != movement['revision']):
+                self.entries.pop(role)
+                entry = None
+            if now - state['seen'] > 1.2:
+                self.entries.pop(role, None)
+                continue
+            pose = result.get(role)
+            if pose is not None and pose['confidence'] >= MIN_TRACKING_CONFIDENCE:
+                entry = {'client': state, 'revision': movement['revision'], 'pose': pose}
+                self.entries[role] = entry
+            elif (entry and movement['motionAvailable'] and not movement['moving']
+                  and not movement['markerVisible']):
+                result[role] = entry['pose']
+                held.append(role)
+            if role in result and entry is not None:
+                revisions[role] = entry['revision']
+        return [result[role] for role in sorted(result)], revisions, held
 
 
 def near_misses(rejected, found):
@@ -192,12 +304,13 @@ def list_devices():
 
 def calibrate(args, config):
     cap, reader = open_camera(args.camera), detector()
+    allowed_ids = set(REFERENCE_IDS)
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 raise RuntimeError("Camera stopped delivering frames")
-            markers = detect(frame, reader)
+            markers = detect(frame, reader, allowed_ids=allowed_ids)
             pixels = reference_pixels(markers)
             note = "Show markers 10, 11, 12, 13; SPACE captures, Q quits"
             matrix, residual = None, None
@@ -223,6 +336,15 @@ def calibrate(args, config):
         cv2.destroyAllWindows()
 
 
+def preview_geometry(frame, markers, matrix, mirrored=True):
+    """Mirror only the display; camera/world geometry and packets stay unchanged."""
+    if not mirrored:
+        return frame.copy(), markers, matrix
+    reflection = np.array([[-1., 0, frame.shape[1] - 1], [0, 1, 0], [0, 0, 1]])
+    return (cv2.flip(frame, 1), {i: project(c, reflection) for i, c in markers.items()},
+            matrix @ reflection if matrix is not None else None)
+
+
 def draw(frame, markers, layout, note, matrix=None):
     for i, corners in markers.items():
         cv2.polylines(frame, [corners.astype(np.int32)], True, (100, 220, 100), 2)
@@ -239,8 +361,17 @@ def draw(frame, markers, layout, note, matrix=None):
             cv2.arrowedLine(frame, tuple(axes[0]), tuple(axes[1]), (80, 255, 80), 2)
             cv2.arrowedLine(frame, tuple(axes[0]), tuple(axes[2]), (80, 80, 255), 2)
             cv2.putText(frame, f'{phone["role"]} ({c["x"]:.1f},{c["y"]:.1f}) cm {math.degrees(phone["headingRad"]):.1f} deg Q {phone["confidence"]:.2f}', tuple(axes[0]), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 2)
-    cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (20, 20, 20), -1)
-    cv2.putText(frame, note[:130], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 1)
+    # Keep size/status diagnostics readable instead of truncating the marker
+    # sizes off the end of a single line.
+    lines = ['']
+    for part in note.split(' · '):
+        if len(lines[-1]) + len(part) > max(45, frame.shape[1] // 12):
+            lines.append(part)
+        else:
+            lines[-1] += (' | ' if lines[-1] else '') + part
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 28 * len(lines) + 14), (20, 20, 20), -1)
+    for line, text in enumerate(lines):
+        cv2.putText(frame, text, (10, 26 + line * 28), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 1)
 
 
 def screen_markers(config):
@@ -254,7 +385,8 @@ def swipe_layout(message, phones, invalid, ready_roles, calibration, config, arg
     reason = invalid
     if not reason and (len(phones) != 2 or {p['role'] for p in phones} != {'A', 'B'}):
         reason = 'Keep both on-screen tracking squares visible'
-    if not reason and any(p['confidence'] < getattr(args, 'min_confidence', .2) for p in phones):
+    threshold = max(MIN_TRACKING_CONFIDENCE, getattr(args, 'min_confidence', MIN_TRACKING_CONFIDENCE))
+    if not reason and any(p['confidence'] < threshold for p in phones):
         reason = 'Tracking square too small or unclear; move it closer to the camera'
     if not reason and polygon_gap(phones[0]['cornersCm'], phones[1]['cornersCm']) < -.2:
         reason = 'Phone outlines overlap; separate the phones or adjust the area'
@@ -283,12 +415,18 @@ async def run(args, config):
         raise ValueError("Camera index changed; recalibrate")
     cap = open_camera(args.camera, getattr(args, 'capture_width', 1920), getattr(args, 'capture_height', 1080), getattr(args, 'capture_fps', None))
     reader, gate = detector(), StabilityGate()
+    confirmation = MarkerConfirmation()
+    pose_cache = MotionPoseCache()
+    allowed_ids = {p['marker_id'] for p in config['phones']}
+    if not auto_anchor:
+        allowed_ids.update(REFERENCE_IDS)
     rate, last_tick = 0.0, None
     if hasattr(cap, 'get'):
         print(f'Camera delivers {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} at {cap.get(cv2.CAP_PROP_FPS):.0f} fps (as reported)', flush=True)
     smoother = PoseSmoother()
     session, sequence = uuid.uuid4().hex, 0
     calibration_moved = False
+    diagnostic_at = 0
     # Camera reads may block. Put capture in a worker so network handling remains responsive.
     clients = {}
     async def handle(ws):
@@ -307,12 +445,23 @@ async def run(args, config):
                 raise ValueError('Invalid screen aspect ratio')
             clients[ws] = {'role': role, 'mode': hello.get('mode', 'join'), 'seen': time.monotonic(),
                            'markerOnScreen': hello.get('markerOnScreen') is True, 'screenAspect': screen_aspect}
+            if hello.get('mode') == 'swipe' and hello.get('markerVisibility') == 'motion':
+                clients[ws]['markerVisibility'] = 'motion'
+                clients[ws]['markerTracking'] = marker_tracking_state(hello.get('markerTracking'))
+                smoother.reset(role)
             async for raw in ws:
                 heartbeat = json.loads(raw)
                 if not isinstance(heartbeat, dict) or heartbeat.get('protocol') != 'distbugs.camera' or heartbeat.get('version') != 1 or heartbeat.get('type') != 'heartbeat' or heartbeat.get('role') != role:
                     await ws.close(1008, 'Invalid camera heartbeat')
                     break
                 clients[ws]['seen'] = time.monotonic()
+                if clients[ws].get('markerVisibility') == 'motion':
+                    movement = marker_tracking_state(heartbeat.get('markerTracking'))
+                    if movement['revision'] < clients[ws]['markerTracking']['revision']:
+                        raise ValueError('Out-of-order marker movement revision')
+                    if movement['revision'] != clients[ws]['markerTracking']['revision']:
+                        smoother.reset(role)
+                    clients[ws]['markerTracking'] = movement
         except (ConnectionClosed, asyncio.TimeoutError, ValueError, TypeError):
             await ws.close(1008, 'Invalid camera handshake or heartbeat')
         finally:
@@ -332,7 +481,7 @@ async def run(args, config):
                 raw = frame.copy() if ok else None
                 if ok:
                     try:
-                        markers = detect(frame, reader, rejected)
+                        markers = confirmation.observe(detect(frame, reader, rejected, allowed_ids), time.monotonic())
                         if matrix is None:
                             roles = {s['role'] for s in clients.values() if s['mode'] == 'swipe' and s['markerOnScreen'] and time.monotonic() - s['seen'] <= 1.2}
                             if roles == {'A', 'B'}:
@@ -384,8 +533,32 @@ async def run(args, config):
                            "calibrationResidualCm": calibration["residualCm"], "jitterCm": gate.jitter_cm,
                            "centreDistanceCm": centre_distance, "relativeYawDeg": relative_yaw}
                 swipe_roles = {s['role'] for s in clients.values() if s['mode'] == 'swipe' and time.monotonic() - s['seen'] <= 1.2}
-                live_phones = smoother.apply(phones, time.monotonic()) if getattr(args, 'command', None) == 'swipe' else phones
+                swipe_states = [s for s in clients.values() if s['mode'] == 'swipe']
+                if invalid is None:
+                    live_phones, revisions, held = pose_cache.resolve(phones, swipe_states, time.monotonic())
+                else:
+                    pose_cache.reset()
+                    live_phones, revisions, held = phones, {}, []
+                live_phones = smoother.apply(live_phones, time.monotonic()) if getattr(args, 'command', None) == 'swipe' else live_phones
                 live_message = swipe_layout({**message, 'phones': live_phones}, live_phones, invalid, swipe_roles, calibration, config, args)
+                if any(s.get('markerVisibility') == 'motion' for s in swipe_states):
+                    live_message['markerRevisions'] = revisions
+                    live_message['needsPositionUpdate'] = live_message['type'] != 'layout'
+                    if held and live_message['type'] == 'layout':
+                        live_message['reason'] = 'Positions saved · codes hidden until a phone moves'
+                diagnostic_dir = getattr(args, 'diagnostics', None)
+                if diagnostic_dir and time.monotonic() - diagnostic_at >= 1:
+                    diagnostic_at = time.monotonic()
+                    folder = Path(diagnostic_dir)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    if raw is not None:
+                        cv2.imwrite(str(folder / 'latest.jpg'), raw)
+                    snapshot = {'fps': rate, 'clients': len(clients), 'reason': live_message['reason'],
+                                'markers': {str(i): c.tolist() for i, c in markers.items()},
+                                'phones': live_phones, 'rawPhones': phones, 'type': live_message['type'],
+                                'heldRoles': held, 'markerRevisions': revisions,
+                                'markerTracking': {s['role']: s.get('markerTracking') for s in swipe_states}}
+                    (folder / 'latest.json').write_text(json.dumps(snapshot, allow_nan=False))
                 if calibration.get('mode') in ('manual', 'screen'):
                     message['type'], message['reason'] = 'layout_invalid', 'Screen/area calibration is for Swipe; use reference-board calibration for camera join'
                 for mode, payload in (('join', message), ('swipe', live_message)):
@@ -403,9 +576,13 @@ async def run(args, config):
                         note += f" · {spec['role']} {size}"
                     if gap is not None:
                         note += f' · gap {gap:.2f} cm'
-                    draw(frame, markers, phones, note, matrix)
+                    mirrored = not getattr(args, 'no_mirror_preview', False)
+                    preview, display_markers, display_matrix = preview_geometry(frame, markers, matrix, mirrored)
+                    draw(preview, display_markers, live_phones, note, display_matrix)
                     if misses:
-                        cv2.polylines(frame, [candidate.astype(np.int32) for candidate in misses], True, (0, 0, 255), 1)
+                        reflection = np.array([[-1., 0, frame.shape[1] - 1], [0, 1, 0], [0, 0, 1]])
+                        cv2.polylines(preview, [(project(candidate, reflection) if mirrored else candidate).astype(np.int32)
+                                               for candidate in misses], True, (0, 0, 255), 1)
                     if centre_distance is not None:
                         checks = f'Centres {centre_distance:.2f} cm | relative turn {relative_yaw:.1f} deg | jitter {gate.jitter_cm:.3f} cm'
                         if args.check_distance_cm is not None:
@@ -413,9 +590,9 @@ async def run(args, config):
                         if args.check_angle_deg is not None:
                             error = math.degrees(math.atan2(math.sin(math.radians(relative_yaw-args.check_angle_deg)), math.cos(math.radians(relative_yaw-args.check_angle_deg))))
                             checks += f' | angle error {error:+.1f} deg'
-                        cv2.putText(frame, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
-                        cv2.putText(frame, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
-                    cv2.imshow(window_name, frame)
+                        cv2.putText(preview, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
+                        cv2.putText(preview, checks, (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
+                    cv2.imshow(window_name, preview)
                     key = cv2.waitKey(1) & 0xff
                     if key == ord('s') and raw is not None:
                         DEBUG_DIR.mkdir(exist_ok=True)
@@ -429,11 +606,14 @@ async def run(args, config):
                             calibration_moved = False
                             anchor.reset()
                             gate.reset()
+                            smoother.reset()
+                            confirmation.reset()
+                            pose_cache.reset()
                             continue
                         return True
                     if key == ord('q') or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                         break
-                await asyncio.sleep(max(0, 1 / args.fps - (time.monotonic() - start)))
+                await asyncio.sleep(max(0, 1 / getattr(args, 'fps', 30) - (time.monotonic() - start)))
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -453,12 +633,14 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--no-mirror-preview", action="store_true", help="Show the camera preview without the default selfie mirror")
+    parser.add_argument("--diagnostics", help="Save latest raw camera image and tracking measurements locally to this folder")
     parser.add_argument("--marker-cm", type=float, help="Swipe: side of the on-screen tracking square in cm (default: screen_marker_cm in the config, else phone_marker_cm)")
     parser.add_argument("--fps", type=float, default=30, help="Maximum layout updates per second; default 30")
     parser.add_argument("--capture-width", type=int, default=1920, help="Requested camera width; lower it (for example 1280) if the camera offers more frames per second there")
     parser.add_argument("--capture-height", type=int, default=1080)
     parser.add_argument("--capture-fps", type=float, help="Requested camera frame rate, for example 60 if the camera supports it at this resolution")
-    parser.add_argument("--min-confidence", type=float, default=.2, help="Swipe: reject squares below this quality (square side / 40 px); default 0.2 = 8 px")
+    parser.add_argument("--min-confidence", type=float, default=MIN_TRACKING_CONFIDENCE, help="Swipe: reject squares below this quality (square side / 40 px); minimum 0.55 = 22 px")
     parser.add_argument("--media-url", help="Local-network URL for the image or video shown by Swipe")
     parser.add_argument("--media-kind", choices=("image", "video"), default="image")
     parser.add_argument("--media-width", type=int, default=1600)

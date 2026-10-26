@@ -6,7 +6,7 @@ from geometry import project, rectangle
 
 
 # Reference capture wants squares at least this many pixels on a side; tracking itself is gated by --min-confidence.
-MIN_SIDE_PX = 14
+MIN_SIDE_PX = 22
 
 
 class ScreenAnchor:

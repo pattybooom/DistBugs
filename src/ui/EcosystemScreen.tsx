@@ -278,7 +278,7 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
   const joinOverlay = bridge.joinOpen && (
     <JoinOverlay role={bridge.role} note={bridge.joinNote} status={bridge.joinStatus} onSwipe={bridge.handleSwipe} onClose={bridge.closeJoin} theme={JOIN_THEME} camera={bridge.camera} onScreenMarkers />
   );
-  // The camera finds each phone by the square it draws, so it stays on top of everything while tracking.
+  // Show the camera square during initial setup and movement; settled layouts hide it.
   const trackingSquare = bridge.camera.enabled && bridge.camera.marker
     ? <TrackingSquare marker={bridge.camera.marker} width={window.width} height={window.height} /> : null;
 
@@ -295,9 +295,10 @@ export function EcosystemScreen({ ecosystem, bridge, onOpenLab }: { ecosystem: E
       <View style={styles.root}>
         <TraitWorkshop
           ecosystemNumber={state.ecosystem}
-          onRelease={(starters, power) => {
+          initialBiome={state.arena.biome}
+          onRelease={(starters, biome) => {
             setSelectedId(null);
-            ecosystem.release(starters, power);
+            ecosystem.release(starters, biome);
           }}
           onRoll={ecosystem.rollStarters}
           onOpenLab={onOpenLab}

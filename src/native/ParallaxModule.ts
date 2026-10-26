@@ -92,6 +92,9 @@ type NativeApi = {
   getCapabilities(): Promise<NativeCapabilities>;
   /** Missing from builds made before peer messages existed. */
   sendPeerMessage?(message: string): Promise<void>;
+  /** Missing from builds made before Swipe sensed movement; without them motion only runs while linked. */
+  startMotion?(): Promise<void>;
+  stopMotion?(): Promise<void>;
   addListener(event: string, listener: (payload: unknown) => void): EventSubscription;
 };
 
@@ -122,6 +125,8 @@ export default {
   sendPeerMessage: (message: string) => native?.sendPeerMessage
     ? native.sendPeerMessage(message)
     : Promise.reject(new Error('This build cannot message the other phone; install a new development build')),
+  startMotion: () => native?.startMotion?.() ?? Promise.resolve(),
+  stopMotion: () => native?.stopMotion?.() ?? Promise.resolve(),
   onMotionUpdated: (cb: (event: MotionEvent) => void) => subscribe('motionUpdated', cb),
   onPeerMessage: (cb: (event: PeerMessageEvent) => void) => subscribe('peerMessage', cb),
   onError: (cb: (error: ParallaxError) => void) => subscribe('error', cb),

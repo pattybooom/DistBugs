@@ -1,5 +1,6 @@
 """Low-latency smoothing for live Swipe poses (One Euro filter)."""
 import math
+from geometry import rectangle
 
 
 def wrap(angle):
@@ -35,37 +36,70 @@ class OneEuro:
 
 
 class PoseSmoother:
-    """Smooths each phone's centre and heading. Forgets a phone that vanished or jumped."""
+    """Smooth live poses while rejecting one-frame corner/decoder spikes.
 
-    def __init__(self, min_cutoff=2.0, position_beta=.4, heading_beta=1.5, forget_s=.5, jump_cm=15):
+    A single ArUco frame can decode correctly while its four corners move by a
+    few pixels. After perspective projection that can look like a centimetre
+    jump. A three-sample median removes that isolated spike, then One Euro
+    keeps the result responsive when a phone really moves.
+    """
+
+    def __init__(self, min_cutoff=.8, position_beta=.15, heading_beta=.5, forget_s=.5, jump_cm=15, median_size=3):
         self.settings = (min_cutoff, position_beta, heading_beta)
         self.forget_s, self.jump_cm = forget_s, jump_cm
+        self.median_size = median_size
         self.filters, self.seen = {}, {}
+        self.history = {}
 
-    def reset(self):
-        self.filters.clear()
-        self.seen.clear()
+    def reset(self, role=None):
+        if role is None:
+            self.filters.clear()
+            self.seen.clear()
+            self.history.clear()
+        else:
+            self.filters.pop(role, None)
+            self.seen.pop(role, None)
+            self.history.pop(role, None)
 
     def _filters(self, role):
         cutoff, position_beta, heading_beta = self.settings
         return self.filters.setdefault(role, (OneEuro(cutoff, position_beta), OneEuro(cutoff, position_beta),
-                                              OneEuro(cutoff, heading_beta, angular=True)))
+                                              OneEuro(cutoff, heading_beta, angular=True), OneEuro(cutoff, .05)))
 
     def apply(self, phones, now):
         present = {p['role'] for p in phones}
         for role in list(self.filters):
-            if role not in present and now - self.seen.get(role, now) > self.forget_s:
+            if now - self.seen.get(role, now) > self.forget_s:
                 self.filters.pop(role)
                 self.seen.pop(role, None)
+                self.history.pop(role, None)
         smoothed = []
         for phone in phones:
             role = phone['role']
-            fx, fy, fh = self._filters(role)
-            centre = phone['centreCm']
-            if fx.x is not None and math.hypot(centre['x'] - fx.x, centre['y'] - fy.x) > self.jump_cm:
-                for f in (fx, fy, fh):
+            fx, fy, fh, fw = self._filters(role)
+            history = self.history.setdefault(role, [])
+            history.append(phone)
+            if len(history) > self.median_size:
+                del history[:-self.median_size]
+            # Three samples suppress a bad frame without making a real move sticky.
+            median_x = sorted(item['centreCm']['x'] for item in history)[len(history) // 2]
+            median_y = sorted(item['centreCm']['y'] for item in history)[len(history) // 2]
+            origin = history[0]['headingRad']
+            median_heading = origin + sorted(wrap(item['headingRad'] - origin) for item in history)[len(history) // 2]
+            # Only reset for a sustained jump. A one-frame decoder/corner
+            # spike must reach the median first, otherwise it would become the
+            # new filter origin and visibly teleport the screen.
+            if fx.x is not None and math.hypot(median_x - fx.x, median_y - fy.x) > self.jump_cm:
+                for f in (fx, fy, fh, fw):
                     f.reset()
             self.seen[role] = now
-            smoothed.append({**phone, 'centreCm': {'x': float(fx(centre['x'], now)), 'y': float(fy(centre['y'], now))},
-                             'headingRad': float(fh(phone['headingRad'], now))})
+            result = {**phone, 'centreCm': {'x': float(fx(median_x, now)), 'y': float(fy(median_y, now))},
+                      'headingRad': float(fh(median_heading, now))}
+            if 'widthCm' in phone and 'heightCm' in phone:
+                width = sorted(item['widthCm'] for item in history)[len(history) // 2]
+                result['widthCm'] = float(fw(width, now))
+                result['heightCm'] = result['widthCm'] * phone['heightCm'] / phone['widthCm']
+                result['cornersCm'] = rectangle((result['centreCm']['x'], result['centreCm']['y']),
+                                                result['headingRad'], result['widthCm'], result['heightCm']).tolist()
+            smoothed.append(result)
         return smoothed
